@@ -1,0 +1,23 @@
+[package]
+name = "gitmux"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Many coding agents, one git checkout: each commits only its own paths, verified by the repository's hooks, without stashing anyone's work"
+repository = "https://github.com/nikolay-e/gitmux"
+readme = "README.md"
+keywords = ["git", "agents", "monorepo", "pre-commit", "claude"]
+categories = ["development-tools", "command-line-utilities"]
+
+[[bin]]
+name = "git-mux"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
