@@ -7,11 +7,13 @@ use std::path::{Path, PathBuf};
 const HEADER: &str = "#!/bin/sh\n# Installed by git-mux (https://github.com/nikolay-e/gitmux); rewritten on every git-mux run.\n";
 
 const GUARD: &str = r#"# In the shared checkout a commit, stash or push made outside git-mux stashes or sweeps in other
-# sessions' work, so git refuses it here. Linked worktrees are not guarded. GIT_MUX=1 overrides.
-[ -n "$GIT_MUX" ] && exit 0
+# sessions' work, so git refuses it here. Linked worktrees are not guarded. GIT_MUX=1 overrides a
+# commit; never a push, whose hooks would run in the live tree (git mux push needs none here).
+[ -n "$GIT_MUX" ] && [ "$1" != push ] && exit 0
 [ "$(git rev-parse --absolute-git-dir)" = "$(git rev-parse --path-format=absolute --git-common-dir)" ] || exit 0
-echo "git-mux: plain git $1 in the shared checkout $(git rev-parse --show-toplevel) is refused." \
-  "Commit with: git mux commit -m MSG -- PATH...; push with: git mux push" >&2
+echo "git-mux: plain git $1 in the shared checkout $(git rev-parse --show-toplevel) is refused:" \
+  "its hooks would run among other sessions' unsaved files. Commit with: git mux commit -m MSG -- PATH...;" \
+  "push with: git mux push, or push from a linked worktree or a bare clone" >&2
 exit 1
 "#;
 

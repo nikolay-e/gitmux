@@ -519,7 +519,8 @@ fn git_itself_refuses_commit_stash_and_push_in_the_shared_checkout() {
         &t.repo,
         &["git", "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "x"],
     );
-    let target = t.tmp.to_string_lossy().into_owned();
+    let target = t.tmp.join("elsewhere.git").to_string_lossy().into_owned();
+    t.sh(&t.tmp, &["git", "init", "-q", "--bare", &target]);
     let refused: [&[&str]; 5] = [
         &["commit", "-qam", "area: x"],
         &["commit", "-qam", "area: x", "--no-verify"],
@@ -530,6 +531,19 @@ fn git_itself_refuses_commit_stash_and_push_in_the_shared_checkout() {
     for args in refused {
         assert!(!t.git_ok(&t.repo, args), "{args:?}");
     }
+    // `git mux push` runs pre-push in a slot and pushes with --no-verify, so a pre-push hook in
+    // the live tree has no legitimate caller: the override does not open it.
+    let overridden = cmd("git", &t.tmp)
+        .env("GIT_MUX", "1")
+        .args(["push", "-q", &target, "HEAD:refs/heads/main"])
+        .current_dir(&t.repo)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&overridden.stderr).contains("git mux push"));
+    assert!(!t.git_ok(
+        &t.tmp.join("elsewhere.git"),
+        &["rev-parse", "-q", "--verify", "main"]
+    ));
     assert_eq!(t.read("b.txt"), "another session's unsaved edit\n");
     assert_eq!(t.rev(&t.repo, "HEAD"), head);
     assert_eq!(t.sh(&t.repo, &["git", "stash", "list"]), "");
