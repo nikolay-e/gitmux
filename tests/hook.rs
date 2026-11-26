@@ -382,12 +382,14 @@ fn events_close_the_pending_calls_they_can_know_are_over() {
         assert!(passes(&fire(&t, "A", "PreToolUse", extra)));
     };
     let keys = |t: &T| -> Vec<String> {
-        pending(t, "A")
+        let mut keys: Vec<String> = pending(t, "A")
             .as_object()
             .unwrap()
             .keys()
             .cloned()
-            .collect()
+            .collect();
+        keys.sort();
+        keys
     };
 
     call("denied", None);
