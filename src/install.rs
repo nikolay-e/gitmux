@@ -1,6 +1,6 @@
 use crate::guard;
 use crate::repo::{Repo, write_atomic};
-use crate::run::{Cmd, Result};
+use crate::run::{Cmd, Result, refuse};
 use crate::slot;
 use serde_json::{Value, json};
 use std::fs;
@@ -207,11 +207,14 @@ fn wire_project(repo: &Repo, exe: &Path) -> Result<()> {
         ("PermissionDenied", Some("Bash")),
     ];
     let changed = wire(&file, &events, &hook)?;
-    let ignored = Cmd::git(&repo.main_root())
-        .args(["check-ignore", "-q", "--"])
-        .arg(&file)
-        .out()?
-        .ok();
+    let checked = Cmd::git(&repo.main_root())
+        .env_remove("GIT_LITERAL_PATHSPECS")
+        .args(["check-ignore", "-q", "--", ".claude/settings.local.json"])
+        .out()?;
+    if checked.code > 1 {
+        refuse!("git check-ignore failed: {}", checked.stderr.trim());
+    }
+    let ignored = checked.ok();
     if !ignored {
         let exclude = repo.common.join("info/exclude");
         fs::create_dir_all(exclude.parent().unwrap())?;
