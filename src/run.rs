@@ -82,6 +82,11 @@ impl Cmd {
         self
     }
 
+    pub fn cwd(mut self, dir: &Path) -> Self {
+        self.cmd.current_dir(dir);
+        self
+    }
+
     pub fn env(mut self, key: &str, value: impl AsRef<OsStr>) -> Self {
         self.cmd.env(key, value);
         self

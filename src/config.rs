@@ -3,13 +3,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Settings live in git config: the repository's own `.git/config` wins over a committed
-/// `.gitmux` file in git-config syntax, which carries the team's defaults.
+/// `.gitmux` file in git-config syntax, which carries the team's defaults. `selfInstall` replaces
+/// the running binary, so only the local config may set it.
 pub struct Config {
     pub slots: usize,
     pub slot_dir: PathBuf,
     pub agents: Vec<String>,
     pub components: String,
     pub self_install: Option<String>,
+    pub slot_setup: Option<String>,
 }
 
 fn read(root: &Path, file: Option<&Path>) -> HashMap<String, Vec<String>> {
@@ -42,6 +44,29 @@ pub fn expand_user(path: &str) -> PathBuf {
     }
 }
 
+/// `${XDG_CACHE_HOME:-~/.cache}/gitmux/slots/<name>-<8 hex of the common dir's hash>`, outside
+/// the repository, one per repository.
+fn default_slot_dir(root: &Path, common: &Path) -> Option<PathBuf> {
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".cache")))?;
+    let name = match common.file_name() {
+        Some(n) if n == ".git" => common.parent().and_then(Path::file_name),
+        other => other,
+    }?;
+    let hash = Cmd::git(root)
+        .args(["hash-object", "--stdin"])
+        .input(common.to_string_lossy().into_owned())
+        .text()
+        .ok()?;
+    Some(
+        cache
+            .join("gitmux/slots")
+            .join(format!("{}-{}", name.to_string_lossy(), hash.get(..8)?)),
+    )
+}
+
 impl Config {
     pub fn load(root: &Path, state: &Path) -> Config {
         let file = root.join(".gitmux");
@@ -67,6 +92,7 @@ impl Config {
                 .unwrap_or(2),
             slot_dir: one("gitmux.slotdir")
                 .map(|d| root.join(expand_user(&d)))
+                .or_else(|| default_slot_dir(root, state.parent().unwrap_or(state)))
                 .unwrap_or_else(|| state.join("slots")),
             agents: if agents.is_empty() {
                 vec!["claude".into(), "codex".into()]
@@ -74,7 +100,12 @@ impl Config {
                 agents
             },
             components: one("gitmux.components").unwrap_or_else(|| "components.json".into()),
-            self_install: one("gitmux.selfinstall").map(|p| p.trim_end_matches('/').to_string()),
+            self_install: local
+                .get("gitmux.selfinstall")
+                .and_then(|v| v.last())
+                .filter(|v| !v.is_empty())
+                .map(|p| p.trim_end_matches('/').to_string()),
+            slot_setup: one("gitmux.slotsetup"),
         }
     }
 }

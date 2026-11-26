@@ -1,7 +1,14 @@
 use crate::repo::Repo;
-use crate::run::{Cmd, Result, zsplit};
+use crate::run::{Cmd, Result, refuse, zsplit};
 use std::fs::{self, File};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
+
+const LOCK_REASON: &str = "git-mux verification slot";
+
+/// The checkout's effective hooks dir of the latest slot: what `run_hook` compares the slot with.
+static LIVE_HOOKS: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 pub struct Slot {
     pub dir: PathBuf,
@@ -40,7 +47,7 @@ pub fn slot_at(repo: &Repo, commit: &str, parent: Option<&str>) -> Result<Slot> 
     // Locked, so worktree cleanup never deletes a slot and the dependencies built inside it.
     let _ = repo
         .git()
-        .args(["worktree", "lock", "--reason", "git-mux verification slot"])
+        .args(["worktree", "lock", "--reason", LOCK_REASON])
         .arg(&dir)
         .out();
     let git = || Cmd::git(&dir);
@@ -53,49 +60,91 @@ pub fn slot_at(repo: &Repo, commit: &str, parent: Option<&str>) -> Result<Slot> 
     if let Some(p) = parent {
         git().args(["reset", "--soft", "-q", p]).text()?;
     }
-    provision_node_modules(repo, &dir)?;
+    copy_untracked_hooks(repo, &dir)?;
+    *LIVE_HOOKS.lock().unwrap_or_else(|e| e.into_inner()) = hooks_dir(&repo.root);
+    if let Some(setup) = &repo.cfg.slot_setup {
+        let out = Cmd::new("sh")
+            .args(["-c", setup])
+            .cwd(&dir)
+            .env("GITMUX_LIVE", &repo.root)
+            .env("GITMUX_SLOT", &dir)
+            .env_remove("GIT_LITERAL_PATHSPECS")
+            .env_remove("GIT_INDEX_FILE")
+            .out()?;
+        if !out.ok() {
+            refuse!(
+                "slotSetup failed ({}): {}{}",
+                out.code,
+                String::from_utf8_lossy(&out.stdout).trim(),
+                out.stderr.trim()
+            );
+        }
+    }
     Ok(Slot { dir, _lock: lock })
 }
 
-/// Hooks resolve their tools from node_modules beside each lockfile. A copy-on-write clone of
-/// the live directory costs no blocks and keeps realpath() inside the slot.
-fn provision_node_modules(repo: &Repo, slot: &Path) -> Result<()> {
-    let locks = repo
+fn hooks_dir(dir: &Path) -> Option<PathBuf> {
+    let out = Cmd::git(dir)
+        .args(["rev-parse", "--path-format=absolute", "--git-path", "hooks"])
+        .out()
+        .ok()?;
+    out.ok().then(|| PathBuf::from(out.text()))
+}
+
+/// A hooks directory the repository ignores (husky's generated one) is absent from the slot's
+/// checkout, where `git hook run --ignore-missing` would pass silently: its files are copied.
+fn copy_untracked_hooks(repo: &Repo, slot: &Path) -> Result<()> {
+    let configured = repo
         .git()
-        .args([
-            "ls-files",
-            "-z",
-            "--",
-            "package-lock.json",
-            "*/package-lock.json",
-        ])
+        .args(["config", "--get", "core.hooksPath"])
+        .out()?
+        .text();
+    let rel = Path::new(&configured);
+    if configured.is_empty()
+        || !rel
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    {
+        return Ok(());
+    }
+    let listed = repo
+        .git()
+        .args(["ls-files", "-z", "--others", "--"])
+        .arg(rel)
         .raw()?;
-    for lock in zsplit(&locks) {
-        let parent = Path::new(&lock).parent().unwrap_or(Path::new(""));
-        let (live, mine) = (
-            repo.root.join(parent).join("node_modules"),
-            slot.join(parent).join("node_modules"),
-        );
-        if !live.is_dir() {
+    Cmd::git(slot)
+        .args(["clean", "-fdxq", "--"])
+        .arg(rel)
+        .text()?;
+    for file in zsplit(&listed) {
+        let target = slot.join(&file);
+        if target.exists() {
             continue;
         }
-        let stamp = ".package-lock.json";
-        if mine.is_dir() && fs::read(live.join(stamp)).ok() == fs::read(mine.join(stamp)).ok() {
-            continue;
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
         }
-        let _ = fs::remove_dir_all(&mine);
-        fs::create_dir_all(mine.parent().unwrap())?;
-        let cp = if cfg!(target_os = "macos") {
-            Cmd::new("cp").args(["-c", "-R"])
-        } else {
-            Cmd::new("cp").args(["-R", "--reflink=auto"])
-        };
-        cp.arg(&live).arg(&mine).text()?;
+        fs::copy(repo.root.join(&file), &target)?;
     }
     Ok(())
 }
 
+fn runs(hook: &Path) -> bool {
+    fs::metadata(hook).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
 pub fn run_hook(dir: &Path, name: &str, args: &[&str], stdin: Option<&Path>) -> Result<bool> {
+    let live = LIVE_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let (Some(live), Some(mine)) = (live, hooks_dir(dir))
+        && runs(&live.join(name))
+        && !runs(&mine.join(name))
+    {
+        refuse!(
+            "the checkout has an executable {name} hook ({}) that the verification slot lacks ({}); commit it, or ignore it and keep it where the slot copies it from",
+            live.join(name).display(),
+            mine.join(name).display()
+        );
+    }
     let mut c =
         Cmd::git(dir)
             .env_remove("GIT_LITERAL_PATHSPECS")
@@ -106,7 +155,34 @@ pub fn run_hook(dir: &Path, name: &str, args: &[&str], stdin: Option<&Path>) -> 
     c.arg(name).arg("--").args(args).status()
 }
 
-#[allow(dead_code, unused_variables)]
+/// Unlocks and removes every slot git-mux made, in whatever directory it was created.
+#[allow(dead_code)]
 pub fn remove_all(repo: &Repo) -> Result<()> {
+    let listing = repo
+        .git()
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .raw()?;
+    let (mut path, mut ours) = (None, false);
+    let mut slots = Vec::new();
+    for field in listing.split('\0') {
+        if let Some(p) = field.strip_prefix("worktree ") {
+            path = Some(p.to_string());
+            ours = false;
+        } else if field.strip_prefix("locked ") == Some(LOCK_REASON) {
+            ours = true;
+        } else if field.is_empty() && ours {
+            slots.extend(path.take());
+            ours = false;
+        }
+    }
+    for slot in &slots {
+        let _ = repo.git().args(["worktree", "unlock", slot]).out();
+        let _ = repo
+            .git()
+            .args(["worktree", "remove", "--force", slot])
+            .out();
+    }
+    repo.git().args(["worktree", "prune"]).text()?;
+    let _ = fs::remove_dir(&repo.cfg.slot_dir);
     Ok(())
 }
