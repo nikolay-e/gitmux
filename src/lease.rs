@@ -18,7 +18,6 @@ impl Owner {
         Owner::new(text("session_id"), text("agent_id"))
     }
 
-    #[allow(dead_code)]
     pub fn of_process() -> Owner {
         Owner::new(std::env::var("CLAUDE_CODE_SESSION_ID").ok(), None)
     }
@@ -39,10 +38,25 @@ impl Owner {
         self.process.get_or_init(|| agent_process(agents))
     }
 
-    /// Why the lease is another owner's: a different session, two different subagents of one
-    /// session, or, when this caller has no session, a different agent process.
+    /// Why the lease is another owner's: a different session or two different subagents of one
+    /// session. A caller with no session is judged by agent process alone: it is the holder only
+    /// when both have a recorded process and it is the same one.
     fn clash(&self, lease: &Value, agents: &[String]) -> Option<String> {
         let held = lease.get("session")?.as_str()?;
+        if self.session.is_none() {
+            let recorded = |m: &Map<String, Value>| {
+                Some((
+                    m.get("pid")?.as_i64()?,
+                    m.get("start")?.as_str()?.to_string(),
+                ))
+            };
+            let same = lease
+                .as_object()
+                .and_then(recorded)
+                .zip(recorded(self.process(agents)))
+                .is_some_and(|(theirs, mine)| theirs == mine);
+            return (!same).then(|| held.to_string());
+        }
         if held != self.session() {
             return Some(held.to_string());
         }
@@ -52,21 +66,6 @@ impl Owner {
             && mine != theirs
         {
             return Some(format!("{held} (subagent {})", short(theirs)));
-        }
-        let recorded = |m: &Map<String, Value>| {
-            Some((
-                m.get("pid")?.as_i64()?,
-                m.get("start")?.as_str()?.to_string(),
-            ))
-        };
-        if self.session.is_none()
-            && let (Some(theirs), Some(mine)) = (
-                lease.as_object().and_then(recorded),
-                recorded(self.process(agents)),
-            )
-            && theirs != mine
-        {
-            return Some(format!("{held} (process {})", theirs.0));
         }
         None
     }
@@ -226,7 +225,6 @@ pub fn alive(lease: &Value) -> bool {
 }
 
 /// Refuses paths another live owner holds, unless the caller was told to take them over.
-#[allow(dead_code)]
 pub fn refuse_foreign(repo: &Repo, paths: &[String], owner: &Owner, take: bool) -> Result<()> {
     if take {
         return Ok(());
@@ -241,13 +239,11 @@ pub fn refuse_foreign(repo: &Repo, paths: &[String], owner: &Owner, take: bool) 
 }
 
 /// A session that ended holds nothing.
-#[allow(dead_code)]
 pub fn release_session(repo: &Repo, session: &str) -> Result<()> {
     repo.edit_leases(|held| held.retain(|_, lease| lease["session"] != session))
 }
 
 /// A finished subagent hands its files to the session it worked for.
-#[allow(dead_code)]
 pub fn adopt_subagent(repo: &Repo, session: &str, agent: &str) -> Result<()> {
     repo.edit_leases(|held| {
         for lease in held.values_mut() {

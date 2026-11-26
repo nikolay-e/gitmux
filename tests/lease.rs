@@ -6,6 +6,11 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
+/// The binary run as `session`, whatever agent process this suite happens to run under.
+fn as_session(t: &T, session: &str, args: &[&str]) -> Output {
+    t.run(args, &[("CLAUDE_CODE_SESSION_ID", Path::new(session))])
+}
+
 #[test]
 fn leases_keep_sessions_off_each_others_files() {
     let t = T::new();
@@ -43,7 +48,8 @@ fn leases_keep_sessions_off_each_others_files() {
         None
     );
 
-    t.mux(&["commit", "-m", "area: a", "--", "a.txt"]);
+    let o = as_session(&t, "A", &["commit", "-m", "area: a", "--", "a.txt"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(t.hook("B", "Edit", json!({"file_path": a})), None);
 }
 
@@ -207,4 +213,47 @@ fn session_end_releases_the_sessions_leases() {
     );
     assert_eq!(held["x.txt"]["session"], "B");
     assert!(edit(&t, "B", None, "a.txt"));
+}
+
+/// Makes this test process the only agent process the binary recognizes, so that a caller with
+/// no session is identified by it whether or not the suite runs under a real agent.
+fn this_process_is_the_agent(t: &T) {
+    let o = Command::new("ps")
+        .args(["-o", "comm=", "-p", &std::process::id().to_string()])
+        .output()
+        .unwrap();
+    let comm = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    let name = comm.rsplit('/').next().unwrap();
+    t.sh(&t.repo, &["git", "config", "gitmux.agent", name]);
+}
+
+#[test]
+fn a_caller_without_a_session_is_judged_by_agent_process_alone() {
+    let t = T::new();
+    this_process_is_the_agent(&t);
+    for file in ["a.txt", "b.txt"] {
+        assert!(edit(&t, "A", None, file));
+        t.write(file, "A is editing\n");
+    }
+    held_by_this_process(&t, "a.txt");
+    let mut sleeper = Command::new("sleep").arg("60").spawn().unwrap();
+    let mut held = t.leases();
+    held["b.txt"]["pid"] = json!(sleeper.id());
+    held["b.txt"]["start"] = json!(lstart(sleeper.id()));
+    fs::write(t.state().join("leases.json"), held.to_string()).unwrap();
+
+    let other = t.run(&["commit", "-m", "area: other", "--", "b.txt"], &[]);
+    let err = String::from_utf8_lossy(&other.stderr).into_owned();
+    sleeper.kill().unwrap();
+    sleeper.wait().unwrap();
+    assert!(!other.status.success(), "{err}");
+    assert!(err.contains("b.txt") && err.contains("--take"), "{err}");
+
+    let own = t.run(&["commit", "-m", "area: own", "--", "a.txt"], &[]);
+    assert!(
+        own.status.success(),
+        "{}",
+        String::from_utf8_lossy(&own.stderr)
+    );
+    assert_eq!(t.head_file("a.txt"), "A is editing\n");
 }
