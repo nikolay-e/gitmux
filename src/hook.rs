@@ -349,10 +349,14 @@ fn bash(p: &Value, roots: &[Root], cwd: &Path, session: &str, owner: &Owner) -> 
             if inv.kind == Kind::Git {
                 if let Some(why) = guard_in(&inv.args, Some(&dir)) {
                     let shown: String = inv.args.join(" ").chars().take(60).collect();
-                    return Ok(Decision::Deny(format!(
-                        "`git {shown}` in the shared checkout {}: {why}.",
-                        root.path.display()
-                    )));
+                    let root = root.path.display();
+                    return Ok(Decision::Deny(if inv.dir.is_some() {
+                        format!("`git {shown}` in the shared checkout {root}: {why}.")
+                    } else {
+                        format!(
+                            "`git {shown}`: can't tell which directory it runs in (a `cd` before it may not run or may fail, or its target is not a literal path), so it counts as the shared checkout {root}: {why}. Name the directory: `cd DIR && git …` or `git -C DIR …`."
+                        )
+                    }));
                 }
             } else if inv.args.first().map(String::as_str) == Some("commit")
                 && !inv.args.iter().any(|a| a == "--take")

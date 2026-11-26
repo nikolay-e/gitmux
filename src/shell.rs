@@ -102,6 +102,8 @@ struct State {
 #[derive(Clone, Copy, PartialEq)]
 enum Term {
     Seq,
+    And,
+    Or,
     Pipe,
     Background,
     End,
@@ -130,6 +132,93 @@ struct Frame {
     st: State,
     after_pipe: bool,
     cases: usize,
+    /// The next command opens its and-or list.
+    first: bool,
+    /// A `||` came earlier in this and-or list.
+    or_seen: bool,
+    /// Compound commands (`if`, loops, `case`, `{`) open around the next command.
+    open: usize,
+    last: Term,
+    /// The state when this and-or list began, which a trailing `&` goes back to.
+    start: State,
+    /// Where a `cd` of this and-or list leaves the shell once the list or a `||` ends it.
+    settle: Option<Option<PathBuf>>,
+}
+
+impl Frame {
+    fn new(st: State) -> Frame {
+        Frame {
+            words: Vec::new(),
+            start: st.clone(),
+            st,
+            after_pipe: false,
+            cases: 0,
+            first: true,
+            or_seen: false,
+            open: 0,
+            last: Term::Seq,
+            settle: None,
+        }
+    }
+
+    /// A `cd` or `pushd` to `to`. Commands joined after it by `&&` run there, since they run only
+    /// if it worked; past that the shell is surely there only when the `cd` opened its list
+    /// outside any compound command and its target exists, and a `cd` after a `||` may not run.
+    fn moved(&mut self, to: Option<PathBuf>, calm: bool) {
+        if self.or_seen {
+            self.st.dir = None;
+            self.settle = Some(None);
+            return;
+        }
+        let sure = calm && self.first && to.as_deref().is_some_and(Path::is_dir);
+        self.settle = Some(to.clone().filter(|_| sure));
+        self.st.dir = to;
+    }
+
+    fn settled(&mut self) {
+        if let Some(dir) = self.settle.take() {
+            self.st.dir = dir;
+        }
+    }
+
+    fn ended(&mut self, term: Term) {
+        match term {
+            Term::Or => {
+                self.settled();
+                self.or_seen = true;
+            }
+            Term::Seq | Term::End | Term::Background => {
+                if term == Term::Background {
+                    self.st = self.start.clone();
+                    self.settle = None;
+                }
+                self.settled();
+                self.or_seen = false;
+                self.start = self.st.clone();
+            }
+            Term::And | Term::Pipe => {}
+        }
+        self.first = matches!(term, Term::Seq | Term::End | Term::Background);
+        self.last = term;
+    }
+
+    /// Tracks the compound commands a command opens and closes; openers count at the start of a
+    /// command (`{` anywhere), closers only there.
+    fn track_compound(&mut self, words: &[Word]) {
+        self.open += words.iter().filter(|w| w.text == "{").count();
+        for w in words {
+            match w.text.as_str() {
+                "if" | "while" | "until" => self.open += 1,
+                "for" | "select" | "case" => {
+                    self.open += 1;
+                    break;
+                }
+                "fi" | "done" | "esac" | "}" => self.open = self.open.saturating_sub(1),
+                t if SKIPPED.contains(&t) => {}
+                _ => break,
+            }
+        }
+    }
 }
 
 enum ShellUse {
@@ -272,6 +361,8 @@ struct Scan {
     pos: usize,
     pending: Vec<Pending>,
     out: Vec<Invocation>,
+    /// A function is defined somewhere in the text, so any later `cd` may run again unseen.
+    functions: bool,
 }
 
 impl Scan {
@@ -281,6 +372,7 @@ impl Scan {
             pos: 0,
             pending: Vec::new(),
             out: Vec::new(),
+            functions: false,
         }
     }
 
@@ -319,12 +411,7 @@ impl Scan {
         if depth > MAX_DEPTH {
             return None;
         }
-        let mut f = Frame {
-            words: Vec::new(),
-            st,
-            after_pipe: false,
-            cases: 0,
-        };
+        let mut f = Frame::new(st);
         loop {
             self.skip_blanks();
             let Some(c) = self.peek() else {
@@ -353,7 +440,7 @@ impl Scan {
                     self.pos += 1;
                     let term = if self.peek() == Some('&') {
                         self.pos += 1;
-                        Term::Seq
+                        Term::And
                     } else {
                         Term::Background
                     };
@@ -362,7 +449,7 @@ impl Scan {
                 '|' => {
                     self.pos += 1;
                     let term = match self.peek() {
-                        Some('|') => Term::Seq,
+                        Some('|') => Term::Or,
                         _ => Term::Pipe,
                     };
                     if matches!(self.peek(), Some('|' | '&')) {
@@ -372,11 +459,13 @@ impl Scan {
                 }
                 '(' => {
                     self.pos += 1;
-                    self.list(f.st.clone(), depth + 1, true)?;
-                    if f.words
+                    let process_substitution = f
+                        .words
                         .last()
-                        .is_some_and(|w| w.lead == w.text.len() && redirect_of(w).is_some())
-                    {
+                        .is_some_and(|w| w.lead == w.text.len() && redirect_of(w).is_some());
+                    self.functions |= !f.words.is_empty() && !process_substitution;
+                    self.list(f.st.clone(), depth + 1, true)?;
+                    if process_substitution {
                         let mut w = Word::default();
                         w.unknown("<(_)");
                         f.words.push(w);
@@ -654,12 +743,20 @@ impl Scan {
     /// what it does to the directory.
     fn finish(&mut self, f: &mut Frame, term: Term, depth: usize) -> Option<()> {
         let raw = std::mem::take(&mut f.words);
+        if raw.is_empty()
+            && term == Term::Seq
+            && matches!(f.last, Term::And | Term::Or | Term::Pipe)
+        {
+            return Some(());
+        }
         let after_pipe = std::mem::replace(&mut f.after_pipe, term == Term::Pipe);
         let (words, redirs) = split_redirects(raw);
         let head = words
             .iter()
             .position(|w| !(is_assignment(&w.text) || SKIPPED.contains(&w.text.as_str())));
         let first = head.map(|h| words[h].text.as_str());
+        f.track_compound(&words);
+        self.functions |= words.first().is_some_and(|w| w.text == "function");
         if first == Some("esac") {
             f.cases = f.cases.saturating_sub(1);
         }
@@ -699,7 +796,8 @@ impl Scan {
                 Redir::Str(_) => {}
             }
         }
-        let moves = term != Term::Pipe && term != Term::Background && !after_pipe;
+        let moves = term != Term::Pipe && !after_pipe;
+        let calm = f.open == 0 && !self.functions;
         match first {
             None => {
                 for w in &words {
@@ -711,10 +809,14 @@ impl Scan {
                     assign(&f.st.dir.clone(), w, &mut f.st.git_dir, &mut f.st.work_tree);
                 }
             }
-            Some("cd" | "pushd") if moves => f.st.dir = change_dir(&f.st.dir, &words[head? + 1..]),
-            Some("popd") if moves => f.st.dir = None,
+            Some(cmd @ ("cd" | "pushd")) if moves => {
+                let to = change_dir(&f.st.dir, &words[head? + 1..], cmd == "pushd");
+                f.moved(to, calm);
+            }
+            Some("popd") if moves => f.moved(None, calm),
             _ => {}
         }
+        f.ended(term);
         Some(())
     }
 
@@ -830,14 +932,15 @@ fn assign(base: &Option<PathBuf>, w: &Word, git_dir: &mut Place, work_tree: &mut
 }
 
 /// Where `cd`/`pushd` with these arguments leaves the shell; None when that cannot be told.
-fn change_dir(from: &Option<PathBuf>, args: &[Word]) -> Option<PathBuf> {
+fn change_dir(from: &Option<PathBuf>, args: &[Word], push: bool) -> Option<PathBuf> {
     let mut operands = args
         .iter()
         .skip_while(|w| w.text.starts_with('-') && w.text.len() > 1 && w.text != "--")
         .filter(|w| w.text != "--");
     match operands.next() {
+        None if push => None,
         None => home(),
-        Some(w) if w.text == "-" => None,
+        Some(w) if w.text == "-" || (push && w.text.starts_with('+')) => None,
         Some(w) => join(from, &w.text, w.dynamic),
     }
 }
@@ -868,12 +971,8 @@ pub fn invocations(command: &str, cwd: &Path) -> Option<Vec<Invocation>> {
 /// A Codex command given as an argv array: one simple command.
 pub fn argv_invocations(argv: &[String], cwd: &Path) -> Option<Vec<Invocation>> {
     let mut scan = Scan::new("");
-    let mut f = Frame {
-        words: argv.iter().map(|a| Word::plain(a)).collect(),
-        st: start(cwd),
-        after_pipe: false,
-        cases: 0,
-    };
+    let mut f = Frame::new(start(cwd));
+    f.words = argv.iter().map(|a| Word::plain(a)).collect();
     scan.finish(&mut f, Term::End, 0)?;
     Some(scan.out)
 }

@@ -236,6 +236,63 @@ fn an_unknown_directory_counts_as_the_root_the_shell_is_in_or_names() {
 }
 
 #[test]
+fn a_cd_that_may_not_have_run_leaves_the_directory_unknown() {
+    let t = T::new();
+    let other = t.tmp.join("other");
+    fs::create_dir(&other).unwrap();
+    let wt = t.tmp.join("linked");
+    t.sh(
+        &t.repo,
+        &[
+            "git",
+            "worktree",
+            "add",
+            "-q",
+            &wt.to_string_lossy(),
+            "-b",
+            "wt",
+        ],
+    );
+    let (o, missing) = (other.display(), t.tmp.join("missing").display().to_string());
+    let denial = |command: &str| denied(&bash(&t, "A", "PreToolUse", "1", &t.repo, json!(command)));
+    let refused = [
+        "git clean -fdx".to_string(),
+        format!("true || cd {o}; git clean -fdx"),
+        format!("if false; then cd {o}; fi; git clean -fdx"),
+        format!("cd {missing}; git clean -fdx"),
+        format!("(cd {o}); git clean -fdx"),
+        format!("D={o} cd $D && git clean -fdx"),
+        format!("cd {o} && true & git clean -fdx"),
+        format!("case x in x) cd {o};; esac; git clean -fdx"),
+        format!("f() {{ cd {o}; }}; git clean -fdx"),
+        format!("A || cd {o} && git clean -fdx"),
+        format!("false && cd {o}; git clean -fdx"),
+    ];
+    for command in &refused {
+        let reason = denial(command).unwrap_or_else(|| panic!("allowed: {command}"));
+        assert!(reason.contains("shared checkout"), "{command}: {reason}");
+    }
+    let reason = denial(&format!("true || cd {o}; git clean -fdx")).unwrap();
+    assert!(reason.contains("can't tell which directory"), "{reason}");
+    assert!(reason.contains("`git -C DIR"), "{reason}");
+    let reason = denial("cd $D && git commit -m x").unwrap();
+    assert!(reason.contains("can't tell which directory"), "{reason}");
+    let known = denial("git clean -fdx").unwrap();
+    assert!(!known.contains("can't tell"), "{known}");
+
+    let allowed = [
+        format!("cd {o} && git clean -fdx"),
+        format!("cd {o}; git clean -fdx"),
+        format!("cd {o}\ngit clean -fdx"),
+        format!("cd {o} || exit 1; git clean -fdx"),
+        format!("cd {} && git commit -m x", wt.display()),
+    ];
+    for command in &allowed {
+        assert_eq!(denial(command), None, "{command}");
+    }
+}
+
+#[test]
 fn an_unparseable_command_is_refused_when_it_could_be_git_in_the_root() {
     let t = T::new();
     let go = |cwd: &Path, command: &str| bash(&t, "A", "PreToolUse", "1", cwd, json!(command));

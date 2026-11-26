@@ -16,11 +16,18 @@ fn shell_guard() {
     t.sh(&t.repo, &["git", "config", "alias.wipe", "clean -fd"]);
     t.sh(&t.repo, &["git", "config", "alias.bang", "!git clean -fd"]);
     let repo = t.repo.to_string_lossy().into_owned();
+    let other = t.tmp.join("other");
+    std::fs::create_dir(&other).unwrap();
+    let other = other.to_string_lossy().into_owned();
+    let missing = t.tmp.join("missing").to_string_lossy().into_owned();
     let refused = |command: &str| {
         t.hook(
             "A",
             "Bash",
-            json!({"command": command.replace("{repo}", &repo)}),
+            json!({"command": command
+                .replace("{repo}", &repo)
+                .replace("{other}", &other)
+                .replace("{missing}", &missing)}),
         )
         .is_some()
     };
@@ -105,6 +112,41 @@ fn shell_guard() {
         ("cd \"$(pwd)\" && git clean -fd", true),
         ("cd $X && git clean -fd", true),
         ("cd - && git clean -fd", true),
+        // a `cd` counts only when it surely ran
+        ("cd {other} && git clean -fd", false),
+        ("cd {other}; git clean -fd", false),
+        ("cd {other}\ngit clean -fd", false),
+        ("cd {other} &&\n git clean -fd", false),
+        ("cd {other} || exit 1; git clean -fd", false),
+        ("cd {other} && true; git clean -fd", false),
+        ("cd {other} && cd {repo}; git clean -fd", true),
+        ("cd {other} && cd {repo} && git clean -fd", true),
+        ("cd {missing}; git clean -fd", true),
+        ("cd {missing} || git clean -fd", true),
+        ("true || cd {other}; git clean -fd", true),
+        ("A || cd {other} && git clean -fd", true),
+        ("false && cd {other}; git clean -fd", true),
+        ("false && cd {other} && git clean -fd", false),
+        ("cd {other} && true & git clean -fd", true),
+        ("cd {other} & git clean -fd", true),
+        ("GIT_DIR=/tmp/x/.git & git clean -fd", true),
+        ("if false; then cd {other}; fi; git clean -fd", true),
+        ("if cd {other}; then git clean -fd; fi", true),
+        ("while true; do cd {other}; done; git clean -fd", true),
+        ("for i in 1; do cd {other}; done; git clean -fd", true),
+        ("case x in x) cd {other};; esac; git clean -fd", true),
+        ("{ cd {other}; }; git clean -fd", true),
+        ("{ cd {other} && git clean -fd; }", false),
+        ("f() { cd {other}; }; git clean -fd", true),
+        ("f() { cd {other}; }; cd {other}; git clean -fd", true),
+        (
+            "function f { cd {other}; }; cd {other}; git clean -fd",
+            true,
+        ),
+        ("echo fi; cd {other}; git clean -fd", false),
+        ("D={other} cd $D && git clean -fd", true),
+        ("pushd; git clean -fd", true),
+        ("cd {other}; popd; git clean -fd", true),
         ("git log -C", false),
         ("git --git-dir={repo}/.git clean -fd", true),
         (
