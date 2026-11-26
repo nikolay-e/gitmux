@@ -54,15 +54,16 @@ each other's work.
   process counts as alive, because treating it as gone would hand an unidentified agent's files to
   other sessions; `SessionEnd` releases it.
 - Nothing expires on a clock. A pending shell call closes on an event only — `PostToolUse`,
-  `PostToolUseFailure`, `PermissionDenied`, `Stop`, `StopFailure`, `Interrupt`, `SubagentStop`, `SessionEnd` or
-  a gone agent process. A call that was cancelled or refused by a dialog degrades attribution to
-  "unowned" until the session's next `Stop`, never to a wrong owner. A shell command's writes
-  become its session's only when no other session was active in the same window.
+  `PostToolUseFailure`, `PermissionDenied`, `Stop`, `StopFailure`, `Interrupt`, `SubagentStop`,
+  `SessionEnd` or a gone agent process. A call that was cancelled or refused by a dialog degrades
+  attribution to "unowned" until the session's next `Stop`, never to a wrong owner. A shell
+  command's writes become its session's only when no other session was active in the same window.
 - One normalizer maps each agent's events and tools (Gemini's `BeforeTool`, `run_shell_command`, …)
   to the internal vocabulary, and the dialect is an explicit argument (`git mux hook gemini`),
-  because `SessionStart` and `SessionEnd` share names across agents. Exit 2 only where a call can
-  be refused (`PreToolUse`, `BeforeTool`, an unknown event); every other event reports and exits
-  0, since exit 2 there keeps an agent working, makes Gemini retry or hides a command's output.
+  because `SessionStart` and `SessionEnd` share names across agents. Exit 2 only where a call can be
+  refused (`PreToolUse`, `BeforeTool`, an unknown Claude Code or Codex event); every other event
+  reports and exits 0, since exit 2 there keeps an agent working, makes Gemini retry or hides a
+  command's output.
 - Only `git mux install` enrolls a checkout; every other command repairs the guards of one that
   is enrolled and touches nothing else. `uninstall` gives every hook file back byte for byte (a
   pre-commit it created is deleted).
