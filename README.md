@@ -161,12 +161,13 @@ Two layers, independent of each other, so that a gap in one does not open the ot
   Input sent to a running command with Codex's `write_stdin`, for example into an interactive
   shell it started, does not pass `PreToolUse`, so only the git-level guards apply to it.
 
-**Under Gemini CLI** git runs none of the repository's hooks for the commands Gemini starts,
-because Gemini empties `core.hooksPath` for them: the git-level guards above do not fire, only the
-hook guard refuses, and a git call it cannot see, such as one inside a script or a program, is not
-refused. `git mux commit` and `git mux push` still run the repository's hooks, because git-mux
-drops an injected hooks path. Gemini also empties `credential.helper` for its commands, so a push
-from Gemini cannot use a credential helper.
+**Under Gemini CLI** git runs none of the repository's hooks for the commands Gemini starts, because
+Gemini empties `core.hooksPath` for them: the git-level guards above do not fire, only the hook
+guard refuses, and a git call it cannot see, such as one inside a script or a program, is not
+refused. `git mux commit` and `git mux push` still run the repository's hooks, because git-mux drops
+an injected hooks path; they refuse a hooks path given with `git -c core.hooksPath=…`, which reaches
+every git command they run and cannot be dropped. Gemini also empties `credential.helper` for its
+commands, so a push from Gemini cannot use a credential helper.
 
 **Known limits**: a *configured* hook (`hook.<name>.event`, git 2.54 and newer) is the one commit
 or push hook that can run in the live tree: it runs before any hook file and cannot be stopped by

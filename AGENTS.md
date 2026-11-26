@@ -38,20 +38,21 @@ each other's work.
   unknown, never wrong: the command then counts as the checkout the shell is in, else as every
   checkout the text names, and the refusal says so.
 - The agent hook parses every payload and fails closed: a crash, a git error or an unreadable
-  payload that names an enrolled checkout exits 2, which Claude Code, Codex and Gemini CLI honour as a
-  refusal. A call that concerns no enrolled checkout exits 0, and events that cannot refuse a call never
-  do (exit 2 on `Stop` would force the agent on). Two handlers run per call: the user-level one is
-  a shell wrapper that exits 0 when the binary is missing, so other projects are never blocked;
-  the project one (`.claude/settings.local.json`, exec form, `onFailure: "block"`) refuses where
-  the checkout is enrolled. Claude Code runs an identical handler from two files once, which is
-  why the commands differ, so every handler is idempotent per `tool_use_id`. Codex gets no
+  payload that names an enrolled checkout exits 2, which Claude Code, Codex and Gemini CLI honour as
+  a refusal. A call that concerns no enrolled checkout exits 0, and events that cannot refuse a call
+  never do (exit 2 on `Stop` would force the agent on). Two handlers run per call: the user-level
+  one is a shell wrapper that exits 0 when the binary is missing, so other projects are never
+  blocked; the project one (`.claude/settings.local.json`, exec form, `onFailure: "block"`) refuses
+  where the checkout is enrolled. Claude Code runs an identical handler from two files once, which
+  is why the commands differ, so every handler is idempotent per `tool_use_id`. Codex gets no
   project file and is treated as fail-open until its failure semantics are documented. Gemini sends
   no tool call id, so its pending-call key is a digest of the tool name and input.
-- A lease belongs to a session, a subagent's `agent_id` and the agent process (pid plus start
-  time; an agent is an executable named in `gitmux.agent` or the script `node` runs, as Gemini's), never to the session id alone: two subagents of one session clash, and a gone agent
-  frees its files. A caller with no session is judged by agent process only. A lease or shell
-  log with no recorded process counts as alive, because treating it as gone would hand an
-  unidentified agent's files to other sessions; `SessionEnd` releases it.
+- A lease belongs to a session, a subagent's `agent_id` and the agent process (pid plus start time;
+  an agent is an executable named in `gitmux.agent` or the script `node` runs, as Gemini's), never
+  to the session id alone: two subagents of one session clash, and a gone agent frees its files. A
+  caller with no session is judged by agent process only. A lease or shell log with no recorded
+  process counts as alive, because treating it as gone would hand an unidentified agent's files to
+  other sessions; `SessionEnd` releases it.
 - Nothing expires on a clock. A pending shell call closes on an event only — `PostToolUse`,
   `PostToolUseFailure`, `PermissionDenied`, `Stop`, `Interrupt`, `SubagentStop`, `SessionEnd` or
   a gone agent process. A call that was cancelled or refused by a dialog degrades attribution to
@@ -93,17 +94,18 @@ each other's work.
 - An agent's environment can switch git hooks off: Gemini injects `core.hooksPath=""` through
   `GIT_CONFIG_COUNT` for every command it runs, and `git hook run` would then verify nothing. So
   git-mux's own git calls drop an injected `core.hooksPath` (other injected pairs stay), and
-  `commit` and `push` refuse a `core.hooksPath` from `GIT_CONFIG_PARAMETERS`. Under Gemini the git
-  layer never fires for its own commands; only the agent hook guards there. Gemini runs hooks only
-  in trusted folders, and its hooks are user-level only: it has no fail-closed project file.
+  `commit` and `push` refuse a `core.hooksPath` from `GIT_CONFIG_PARAMETERS`, which is what
+  `git -c core.hooksPath=…` writes and cannot be dropped. Under Gemini the git layer never fires
+  for its own commands; only the agent hook guards there. Gemini runs hooks only in trusted
+  folders, and its hooks are user-level only: it has no fail-closed project file.
 - Every git call runs with `GIT_LITERAL_PATHSPECS=1` so `[id]` paths stay literal; what runs user
   code (hooks, `slotSetup`) or needs a glob has it removed. `slotSetup` is shell run for anyone
   who commits in the checkout, the same trust as its hooks; `selfInstall` replaces the binary, so
   only local git config may set it, never the committed `.gitmux`.
-- Tests drive the real binary against real repositories, hooks and processes (`tests/*.rs` on
-  the harness in `tests/common`); each test sets `HOME`, `XDG_CONFIG_HOME` and `XDG_CACHE_HOME`
-  so nothing reaches the developer's agent config or slot cache, and no lease test may depend on
-  an ambient `claude`, `codex` or `gemini` ancestor process. `GITMUX_TEST_PRE_COMMIT=1` makes a missing
+- Tests drive the real binary against real repositories, hooks and processes (`tests/*.rs` on the
+  harness in `tests/common`); each test sets `HOME`, `XDG_CONFIG_HOME` and `XDG_CACHE_HOME` so
+  nothing reaches the developer's agent config or slot cache, and no lease test may depend on an
+  ambient `claude`, `codex` or `gemini` ancestor process. `GITMUX_TEST_PRE_COMMIT=1` makes a missing
   `pre-commit` a failure instead of a skip.
 - This crate lives in a monorepo and is published by `git subtree split --prefix=gitmux`: it must
   not name the monorepo, its hosts or its people.
