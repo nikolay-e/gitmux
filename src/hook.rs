@@ -1,9 +1,9 @@
-//! The Claude Code / Codex Pre- and PostToolUse hook. Exit 2 with the reason on stderr is the one
+//! The Claude Code / Codex tool and session hook. Exit 2 with the reason on stderr is the one
 //! blocking signal both honour, so a refusal and a crash both end that way.
 use crate::commit::expand;
 use crate::install::registered_roots;
-use crate::lease::{Owner, agent_process, alive, holder, short};
-use crate::repo::{Repo, inside, now, read_json};
+use crate::lease::{self, Owner, agent_process, alive, holder, short};
+use crate::repo::{Repo, inside, normalize, now, posix, read_json, resolve};
 use crate::run::{Result, zsplit};
 use crate::shell::{Kind, argv_invocations, commit_paths, guard_git, invocations, patch_paths};
 use serde_json::{Map, Value, json};
@@ -20,29 +20,105 @@ const SNAPSHOTS: usize = 8;
 enum Decision {
     Allow,
     Deny(String),
+    /// Context for the model after a tool call.
     Note(String),
+    /// Plain stdout, which the agents take as context at session start.
+    Say(String),
+}
+
+/// An enrolled checkout that still exists: as registered, and with symlinks resolved.
+struct Root {
+    path: PathBuf,
+    real: PathBuf,
+}
+
+impl Root {
+    fn mentioned_in(&self, text: &str) -> bool {
+        let mut forms = vec![
+            self.path.to_string_lossy().into_owned(),
+            self.real.to_string_lossy().into_owned(),
+        ];
+        if let Some(home) = std::env::var_os("HOME")
+            && let Ok(rel) = self.path.strip_prefix(&home)
+        {
+            forms.push(format!("~/{}", rel.display()));
+            forms.push(format!("$HOME/{}", rel.display()));
+        }
+        forms.iter().any(|f| text.contains(f.as_str()))
+    }
+
+    fn state(&self) -> PathBuf {
+        self.real.join(".git/gitmux")
+    }
+
+    fn repo(&self) -> Result<Repo> {
+        Repo::open(&self.real)
+    }
+}
+
+fn live_roots() -> Vec<Root> {
+    registered_roots()
+        .into_iter()
+        .filter_map(|path| {
+            let real = fs::canonicalize(&path).ok()?;
+            Some(Root { path, real })
+        })
+        .collect()
+}
+
+/// The shared checkout a path belongs to, and the path inside it: the nearest ancestor holding a
+/// `.git` counts only when that is a directory and a registered root. A linked worktree or
+/// submodule (`.git` file) and a nested repository are free, wherever they stand.
+fn locate<'a>(path: &Path, roots: &'a [Root]) -> Option<(&'a Root, String)> {
+    if !roots.iter().any(|r| inside(path, &r.real)) {
+        return None;
+    }
+    let real = resolve(&normalize(path));
+    let top = real
+        .ancestors()
+        .find(|a| fs::symlink_metadata(a.join(".git")).is_ok())?;
+    if !fs::symlink_metadata(top.join(".git")).ok()?.is_dir() {
+        return None;
+    }
+    let root = roots.iter().find(|r| r.real == top)?;
+    Some((root, posix(real.strip_prefix(top).ok()?)))
+}
+
+fn shared_root_of<'a>(path: &Path, roots: &'a [Root]) -> Option<&'a Root> {
+    locate(path, roots).map(|(root, _)| root)
+}
+
+fn names_git(command: &str) -> bool {
+    command
+        .split(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.')))
+        .any(|w| w == "git" || w == "git-mux")
 }
 
 pub fn main() -> ExitCode {
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
-    let roots = registered_roots();
-    // Most calls concern no enrolled checkout: answer them without parsing or running git.
-    if !roots.iter().any(|r| {
-        r.file_name()
-            .is_some_and(|n| raw.contains(&*n.to_string_lossy()))
-    }) {
+    let roots = live_roots();
+    if roots.is_empty() {
         return ExitCode::SUCCESS;
     }
-    let decision = serde_json::from_str::<Value>(&raw)
-        .map_err(|e| crate::run::Refused(format!("unreadable hook payload: {e}")))
-        .and_then(|p| decide(&p, &roots));
-    match decision {
+    let payload = match serde_json::from_str::<Value>(&raw) {
+        Ok(p) => p,
+        Err(e) if roots.iter().any(|r| r.mentioned_in(&raw)) => {
+            return refuse(&format!("unreadable hook payload: {e}"));
+        }
+        Err(_) => return ExitCode::SUCCESS,
+    };
+    let event = payload["hook_event_name"].as_str().unwrap_or("");
+    match handle(&payload, event, &roots) {
         Ok(Decision::Allow) => ExitCode::SUCCESS,
+        Ok(Decision::Say(text)) => {
+            println!("{text}");
+            ExitCode::SUCCESS
+        }
         Ok(Decision::Note(text)) => {
             println!(
                 "{}",
-                json!({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text}})
+                json!({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}})
             );
             ExitCode::SUCCESS
         }
@@ -50,110 +126,135 @@ pub fn main() -> ExitCode {
             eprintln!("git-mux: {reason}");
             ExitCode::from(2)
         }
-        Err(e) => {
-            eprintln!("git-mux: the shared-checkout guard failed, so the call is refused: {e}");
-            ExitCode::from(2)
+        // Exit 2 on Stop keeps the agent working, and the other lifecycle events cannot refuse
+        // anything: housekeeping that fails is reported and the agent goes on.
+        Err(e) if is_lifecycle(event) => {
+            eprintln!("git-mux: {event} housekeeping failed: {e}");
+            ExitCode::SUCCESS
         }
+        Err(e) => refuse(&e.to_string()),
     }
 }
 
-fn mentions(command: &str, root: &Path) -> bool {
-    let mut forms = vec![root.to_string_lossy().into_owned()];
-    if let Some(home) = std::env::var_os("HOME")
-        && let Ok(rel) = root.strip_prefix(&home)
-    {
-        forms.push(format!("~/{}", rel.display()));
-        forms.push(format!("$HOME/{}", rel.display()));
-    }
-    forms.iter().any(|f| command.contains(f.as_str()))
+fn refuse(why: &str) -> ExitCode {
+    eprintln!("git-mux: the shared-checkout guard failed, so the call is refused: {why}");
+    ExitCode::from(2)
 }
 
-fn root_of<'a>(path: &Path, roots: &'a [PathBuf]) -> Option<&'a PathBuf> {
-    roots.iter().find(|r| inside(path, r))
+fn is_lifecycle(event: &str) -> bool {
+    matches!(
+        event,
+        "PermissionDenied" | "Stop" | "Interrupt" | "SubagentStop" | "SessionStart" | "SessionEnd"
+    )
 }
 
-fn decide(p: &Value, roots: &[PathBuf]) -> Result<Decision> {
-    let tool = p["tool_name"].as_str().unwrap_or("");
-    let data = &p["tool_input"];
+fn handle(p: &Value, event: &str, roots: &[Root]) -> Result<Decision> {
     let cwd = p["cwd"]
         .as_str()
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_default();
-    let post = p["hook_event_name"].as_str() == Some("PostToolUse");
     let session = p["session_id"].as_str().unwrap_or("unknown");
-    let owner = Owner::from_payload(p);
-
-    if tool == "Bash" {
-        let argv: Option<Vec<String>> = data["command"].as_array().map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .map(String::from)
-                .collect()
-        });
-        let command = match &argv {
-            Some(a) => a.join(" "),
-            None => data["command"].as_str().unwrap_or("").to_string(),
-        };
-        let mut touched: BTreeSet<&PathBuf> = roots
-            .iter()
-            .filter(|r| inside(&cwd, r) || mentions(&command, r))
-            .collect();
-        if post {
-            let mut notes = Vec::new();
-            for root in touched {
-                notes.extend(shell_snapshot(&Repo::open(root)?, p, session)?);
-            }
-            return Ok(if notes.is_empty() {
-                Decision::Allow
-            } else {
-                Decision::Note(notes.join("\n"))
-            });
+    let agent = p["agent_id"].as_str();
+    match event {
+        "SessionStart" => Ok(match shared_root_of(&cwd, roots) {
+            Some(root) => Decision::Say(format!(
+                "git-mux: {} is shared with other agents. Commit with `git mux commit -m MSG -- PATH...` and push with `git mux push`; plain commit, stash and push, reset, clean, rebase and broad checkout are refused here. Branch work goes in a linked worktree (`git worktree add`).",
+                root.path.display()
+            )),
+            None => Decision::Allow,
+        }),
+        "PostToolUse" | "PostToolUseFailure" => post(p, roots, session),
+        "PermissionDenied" => {
+            let key = p["tool_use_id"].as_str().unwrap_or("");
+            drop_calls(roots, session, |id, _| id == key)?;
+            Ok(Decision::Allow)
         }
-        let mut claims = Vec::new();
-        let parsed = match &argv {
-            Some(a) => argv_invocations(a, &cwd),
-            None => invocations(&command, &cwd),
-        };
-        for inv in parsed.unwrap_or_default() {
-            let Some(dir) = inv.dir else { continue };
-            let Some(root) = root_of(&dir, roots) else {
-                continue;
+        "Stop" | "Interrupt" => {
+            drop_calls(roots, session, |_, call| call.get("agent_id").is_none())?;
+            Ok(Decision::Allow)
+        }
+        "SubagentStop" => {
+            let Some(agent) = agent else {
+                return Ok(Decision::Allow);
             };
-            touched.insert(root);
-            if inv.kind == Kind::Git {
-                if let Some(why) = guard_git(&inv.args) {
-                    let shown: String = inv.args.join(" ").chars().take(60).collect();
-                    return Ok(Decision::Deny(format!(
-                        "`git {shown}` in the shared checkout {}: {why}.",
-                        root.display()
-                    )));
+            drop_calls(roots, session, |_, call| {
+                call["agent_id"].as_str() == Some(agent)
+            })?;
+            for root in holding(roots, session, true) {
+                lease::adopt_subagent(&root.repo()?, session, agent)?;
+            }
+            Ok(Decision::Allow)
+        }
+        "SessionEnd" => {
+            for root in holding(roots, session, true) {
+                let repo = root.repo()?;
+                {
+                    let _lock = repo.lock("shell")?;
+                    let _ = fs::remove_file(log_path(&repo.state, session));
                 }
-            } else if inv.args.first().map(String::as_str) == Some("commit")
-                && !inv.args.iter().any(|a| a == "--take")
-            {
-                claims.push((root, dir, commit_paths(&inv.args[1..])));
+                lease::release_session(&repo, session)?;
             }
+            Ok(Decision::Allow)
         }
-        for (root, dir, paths) in claims {
-            let repo = Repo::open(root)?;
-            let Ok(paths) = expand(&repo, &paths, Some(&dir)) else {
-                continue;
-            };
-            let held = repo.foreign_leases(&owner, &paths)?;
-            if !held.is_empty() {
-                return Ok(Decision::Deny(format!(
-                    "{held} has uncommitted edits by another live agent; commit only your own paths, or pass --take when that session handed them over."
-                )));
-            }
+        _ => pre(p, roots, &cwd, session),
+    }
+}
+
+/// Roots holding state of the session: its shell log and, when `leases` is set, any lease file.
+fn holding<'a>(roots: &'a [Root], session: &str, leases: bool) -> Vec<&'a Root> {
+    roots
+        .iter()
+        .filter(|r| {
+            log_path(&r.state(), session).exists()
+                || (leases && r.state().join("leases.json").exists())
+        })
+        .collect()
+}
+
+/// Forgets the pending calls `gone` selects, so a call that will never report back stops
+/// counting as a running command.
+fn drop_calls(roots: &[Root], session: &str, gone: impl Fn(&str, &Value) -> bool) -> Result<()> {
+    for root in holding(roots, session, false) {
+        let repo = root.repo()?;
+        let file = log_path(&repo.state, session);
+        let _lock = repo.lock("shell")?;
+        let mut log = call_log(&file);
+        let Some(calls) = log["calls"].as_object_mut() else {
+            continue;
+        };
+        let before = calls.len();
+        calls.retain(|id, call| !gone(id, call));
+        if calls.len() != before {
+            fs::write(&file, log.to_string())?;
         }
-        for root in touched {
-            shell_snapshot(&Repo::open(root)?, p, session)?;
-        }
+    }
+    Ok(())
+}
+
+fn post(p: &Value, roots: &[Root], session: &str) -> Result<Decision> {
+    if p["tool_name"].as_str() != Some("Bash") {
         return Ok(Decision::Allow);
     }
+    let mut notes = Vec::new();
+    for root in holding(roots, session, false) {
+        notes.extend(shell_snapshot(&root.repo()?, p, session, true)?);
+    }
+    Ok(if notes.is_empty() {
+        Decision::Allow
+    } else {
+        Decision::Note(notes.join("\n"))
+    })
+}
 
-    if post || !EDIT_TOOLS.contains(&tool) {
+fn pre(p: &Value, roots: &[Root], cwd: &Path, session: &str) -> Result<Decision> {
+    let tool = p["tool_name"].as_str().unwrap_or("");
+    let data = &p["tool_input"];
+    let owner = Owner::from_payload(p);
+    if tool == "Bash" {
+        return bash(p, roots, cwd, session, &owner);
+    }
+    if !EDIT_TOOLS.contains(&tool) {
         return Ok(Decision::Allow);
     }
     let files: Vec<PathBuf> = if tool == "apply_patch" {
@@ -170,21 +271,19 @@ fn decide(p: &Value, roots: &[PathBuf]) -> Result<Decision> {
         data["file_path"]
             .as_str()
             .or(data["notebook_path"].as_str())
-            .map(PathBuf::from)
+            .map(|f| cwd.join(f))
             .into_iter()
             .collect()
     };
-    for root in roots {
-        let mine: Vec<&PathBuf> = files.iter().filter(|f| inside(f, root)).collect();
-        if mine.is_empty() {
-            continue;
+    let mut by_root: Vec<(&Root, Vec<String>)> = Vec::new();
+    for (root, rel) in files.iter().filter_map(|f| locate(f, roots)) {
+        match by_root.iter_mut().find(|(r, _)| std::ptr::eq(*r, root)) {
+            Some((_, paths)) => paths.push(rel),
+            None => by_root.push((root, vec![rel])),
         }
-        let repo = Repo::open(root)?;
-        let paths: Vec<String> = mine
-            .iter()
-            .filter_map(|f| repo.rel(&f.to_string_lossy(), Some(&cwd)))
-            .collect();
-        let foreign = repo.claim(&owner, &paths)?;
+    }
+    for (root, paths) in by_root {
+        let foreign = root.repo()?.claim(&owner, &paths)?;
         if !foreign.is_empty() {
             let owners: Vec<String> = foreign
                 .iter()
@@ -195,6 +294,91 @@ fn decide(p: &Value, roots: &[PathBuf]) -> Result<Decision> {
                 owners.join(", ")
             )));
         }
+    }
+    Ok(Decision::Allow)
+}
+
+fn bash(p: &Value, roots: &[Root], cwd: &Path, session: &str, owner: &Owner) -> Result<Decision> {
+    let argv: Option<Vec<String>> = p["tool_input"]["command"].as_array().map(|a| {
+        a.iter()
+            .filter_map(Value::as_str)
+            .map(String::from)
+            .collect()
+    });
+    let command = match &argv {
+        Some(a) => a.join(" "),
+        None => p["tool_input"]["command"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
+    };
+    let here = shared_root_of(cwd, roots);
+    let mentioned: Vec<&Root> = roots.iter().filter(|r| r.mentioned_in(&command)).collect();
+    // Where an invocation's directory is unknown, it counts as the checkout the shell is in, else
+    // as any checkout the text names.
+    let fallback: Vec<&Root> = here.map_or_else(|| mentioned.clone(), |r| vec![r]);
+    let mut touched = fallback.clone();
+    for r in mentioned {
+        if !touched.iter().any(|t| std::ptr::eq(*t, r)) {
+            touched.push(r);
+        }
+    }
+    let parsed = match &argv {
+        Some(a) => argv_invocations(a, cwd),
+        None => invocations(&command, cwd),
+    };
+    let Some(parsed) = parsed else {
+        if (here.is_some() || !touched.is_empty()) && names_git(&command) {
+            return Ok(Decision::Deny(
+                "this command cannot be parsed safely; split it into plain commands.".into(),
+            ));
+        }
+        return snapshot_before(&touched, p, session);
+    };
+    let mut claims = Vec::new();
+    for inv in parsed {
+        let dir = inv.dir.clone().unwrap_or_else(|| cwd.to_path_buf());
+        let targets: Vec<&Root> = match &inv.dir {
+            Some(d) => shared_root_of(d, roots).into_iter().collect(),
+            None => fallback.clone(),
+        };
+        for root in targets {
+            if !touched.iter().any(|t| std::ptr::eq(*t, root)) {
+                touched.push(root);
+            }
+            if inv.kind == Kind::Git {
+                if let Some(why) = guard_git(&inv.args) {
+                    let shown: String = inv.args.join(" ").chars().take(60).collect();
+                    return Ok(Decision::Deny(format!(
+                        "`git {shown}` in the shared checkout {}: {why}.",
+                        root.path.display()
+                    )));
+                }
+            } else if inv.args.first().map(String::as_str) == Some("commit")
+                && !inv.args.iter().any(|a| a == "--take")
+            {
+                claims.push((root, dir.clone(), commit_paths(&inv.args[1..])));
+            }
+        }
+    }
+    for (root, dir, paths) in claims {
+        let repo = root.repo()?;
+        let Ok(paths) = expand(&repo, &paths, Some(&dir)) else {
+            continue;
+        };
+        let held = repo.foreign_leases(owner, &paths)?;
+        if !held.is_empty() {
+            return Ok(Decision::Deny(format!(
+                "{held} has uncommitted edits by another live agent; commit only your own paths, or pass --take when that session handed them over."
+            )));
+        }
+    }
+    snapshot_before(&touched, p, session)
+}
+
+fn snapshot_before(touched: &[&Root], p: &Value, session: &str) -> Result<Decision> {
+    for root in touched {
+        shell_snapshot(&root.repo()?, p, session, false)?;
     }
     Ok(Decision::Allow)
 }
@@ -217,6 +401,12 @@ fn tree_state(repo: &Repo) -> Result<Map<String, Value>> {
         state.insert(path.to_string(), v);
     }
     Ok(state)
+}
+
+fn log_path(state: &Path, session: &str) -> PathBuf {
+    state
+        .join("shell")
+        .join(format!("{}.json", file_name(session)))
 }
 
 fn call_log(path: &Path) -> Value {
@@ -268,11 +458,10 @@ fn active_sessions(calls: &Path, session: &str, t0: f64) -> BTreeSet<String> {
 /// the session's only when no other session was active in the same window (an edit, or a shell
 /// command running or finished inside it); a held path that changed is reported only when its
 /// holder was idle, because then this command is the one that wrote it.
-fn shell_snapshot(repo: &Repo, p: &Value, session: &str) -> Result<Option<String>> {
+fn shell_snapshot(repo: &Repo, p: &Value, session: &str, post: bool) -> Result<Option<String>> {
     let calls = repo.state.join("shell");
-    let mine = calls.join(format!("{}.json", file_name(session)));
+    let mine = log_path(&repo.state, session);
     let key = p["tool_use_id"].as_str().unwrap_or("").to_string();
-    let post = p["hook_event_name"].as_str() == Some("PostToolUse");
     let (before, mut busy) = {
         let _lock = repo.lock("shell")?;
         fs::create_dir_all(&calls)?;
@@ -284,7 +473,14 @@ fn shell_snapshot(repo: &Repo, p: &Value, session: &str) -> Result<Option<String
                 log["agent"] = Value::Object(agent_process(&repo.cfg.agents));
             }
             let map = log["calls"].as_object_mut().unwrap();
-            map.insert(key, json!({"t0": now(), "state": tree_state(repo)?}));
+            // Two handlers (global and project) see the same call: the first snapshot stands.
+            if key.is_empty() || !map.contains_key(&key) {
+                let mut call = json!({"t0": now(), "state": tree_state(repo)?});
+                if let Some(agent) = p["agent_id"].as_str() {
+                    call["agent_id"] = json!(agent);
+                }
+                map.insert(key, call);
+            }
             while map.len() > SNAPSHOTS {
                 let oldest = map
                     .iter()
@@ -308,15 +504,30 @@ fn shell_snapshot(repo: &Repo, p: &Value, session: &str) -> Result<Option<String
     };
     let t0 = before["t0"].as_f64().unwrap_or(0.0);
     let now_state = tree_state(repo)?;
+    // Both ways round: a path that left the status (reverted, committed) changed too.
+    let was = before["state"].as_object();
     let changed: Vec<String> = now_state
-        .iter()
-        .filter(|(path, v)| before["state"].get(path.as_str()).unwrap_or(&Value::Null) != *v)
-        .map(|(path, _)| path.clone())
+        .keys()
+        .chain(was.into_iter().flat_map(|m| m.keys()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|path| now_state.get(*path) != was.and_then(|m| m.get(*path)))
+        .cloned()
         .collect();
     if changed.is_empty() {
         return Ok(None);
     }
-    let held = repo.leases()?;
+    // A lease ends when its path equals HEAD again; what was held when the command began still
+    // counts, so a revert of another session's file is seen.
+    let mut held = repo.leases()?;
+    for (path, lease) in read_json(&repo.state.join("leases.json"))
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+    {
+        if was.is_some_and(|m| m.contains_key(&path)) {
+            held.entry(path).or_insert(lease);
+        }
+    }
     busy.extend(
         held.values()
             .filter(|v| v["touched"].as_f64().unwrap_or(0.0) >= t0)
@@ -329,7 +540,7 @@ fn shell_snapshot(repo: &Repo, p: &Value, session: &str) -> Result<Option<String
         .collect();
     let loose: Vec<String> = changed
         .iter()
-        .filter(|c| !noted.contains(c))
+        .filter(|c| !noted.contains(c) && now_state.contains_key(c.as_str()))
         .cloned()
         .collect();
     if !loose.is_empty() && busy.is_empty() {
