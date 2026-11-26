@@ -412,3 +412,65 @@ fn more_than_a_megabyte_of_paths_commits() {
     assert_eq!(names_in_head(&t).lines().count(), count + 4);
     assert_eq!(t.sh(&t.repo, &["git", "status", "--porcelain"]), "");
 }
+
+fn commit_with_env(t: &T, env: &[(&str, &str)], message: &str) -> Output {
+    let mut c = cmd(BIN, &t.tmp);
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    c.args(["commit", "-m", message, "--", "a.txt"])
+        .current_dir(&t.repo)
+        .output()
+        .unwrap()
+}
+
+/// What Gemini CLI's shell tool injects: an empty hooks path next to a pair the caller means.
+const INJECTED: [(&str, &str); 5] = [
+    ("GIT_CONFIG_COUNT", "2"),
+    ("GIT_CONFIG_KEY_0", "core.hooksPath"),
+    ("GIT_CONFIG_VALUE_0", ""),
+    ("GIT_CONFIG_KEY_1", "user.name"),
+    ("GIT_CONFIG_VALUE_1", "injected"),
+];
+
+#[test]
+fn an_injected_hooks_path_does_not_switch_off_the_repositorys_hooks() {
+    let t = T::new();
+    let before = t.rev(&t.repo, "HEAD");
+    t.write("a.txt", "BAD\n");
+    let o = commit_with_env(&t, &INJECTED, "area: bad");
+    assert!(!o.status.success(), "the failing hook must still refuse");
+    assert_eq!(t.rev(&t.repo, "HEAD"), before);
+
+    t.write("a.txt", "good\n");
+    let o = commit_with_env(&t, &INJECTED, "area: good");
+    assert!(o.status.success(), "{}", stderr_of(&o));
+    assert_eq!(t.head_file("a.txt"), "good\n");
+    assert_eq!(
+        t.sh(&t.repo, &["git", "log", "-1", "--format=%an"]).trim(),
+        "injected"
+    );
+}
+
+#[test]
+fn a_hooks_path_given_with_dash_c_is_refused() {
+    let t = T::new();
+    let before = t.rev(&t.repo, "HEAD");
+    t.write("a.txt", "good\n");
+    for parameters in ["'core.hooksPath=/x'", "'core.hookspath'='/x'"] {
+        let o = commit_with_env(&t, &[("GIT_CONFIG_PARAMETERS", parameters)], "area: x");
+        assert!(!o.status.success(), "{parameters}");
+        assert!(
+            stderr_of(&o).contains("core.hooksPath"),
+            "{}",
+            stderr_of(&o)
+        );
+        assert_eq!(t.rev(&t.repo, "HEAD"), before);
+    }
+    let o = commit_with_env(
+        &t,
+        &[("GIT_CONFIG_PARAMETERS", "'user.name=other'")],
+        "area: ok",
+    );
+    assert!(o.status.success(), "{}", stderr_of(&o));
+}

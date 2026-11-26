@@ -14,6 +14,7 @@ fn as_session(t: &T, session: &str, args: &[&str]) -> Output {
 #[test]
 fn leases_keep_sessions_off_each_others_files() {
     let t = T::new();
+    agents(&t, "claude");
     let a = t.repo.join("a.txt").to_string_lossy().into_owned();
     assert_eq!(t.hook("A", "Edit", json!({"file_path": a})), None);
     t.write("a.txt", "A is editing\n");
@@ -163,6 +164,7 @@ fn held_by_this_process(t: &T, file: &str) {
 #[test]
 fn the_binary_refuses_a_file_another_live_session_holds() {
     let t = T::new();
+    agents(&t, "claude");
     for file in ["a.txt", "b.txt"] {
         assert!(edit(&t, "A", None, file));
         t.write(file, "A is editing\n");
@@ -256,4 +258,130 @@ fn a_caller_without_a_session_is_judged_by_agent_process_alone() {
         String::from_utf8_lossy(&own.stderr)
     );
     assert_eq!(t.head_file("a.txt"), "A is editing\n");
+}
+
+/// A `node` that is /bin/sh and a script named like an agent: the shape of `node …/bin/gemini`,
+/// with the node process as the one that stays alive.
+fn fake_node(t: &T, script: &str, body: &str) -> Command {
+    let dir = t.tmp.join("fake").join(script);
+    fs::create_dir_all(&dir).unwrap();
+    let node = dir.join("node");
+    let _ = std::os::unix::fs::symlink("/bin/sh", &node);
+    let file = dir.join(script);
+    fs::write(&file, format!("#!/bin/sh\n{body}")).unwrap();
+    let mut c = cmd(&node.to_string_lossy(), &t.tmp);
+    c.arg(&file)
+        .env("BIN", BIN)
+        .env("PAYLOAD", t.tmp.join("payload.json"))
+        .current_dir("/");
+    c
+}
+
+fn edit_payload(t: &T, session: &str, file: &str) {
+    let payload = json!({"session_id": session, "cwd": t.repo, "tool_name": "Edit",
+                         "tool_input": {"file_path": t.repo.join(file)},
+                         "hook_event_name": "PreToolUse", "tool_use_id": "t"});
+    fs::write(t.tmp.join("payload.json"), payload.to_string()).unwrap();
+}
+
+fn agents(t: &T, names: &str) {
+    t.sh(&t.repo, &["git", "config", "gitmux.agent", names]);
+}
+
+fn commit_under(t: &T, script: &str, session: Option<&str>, file: &str) -> Output {
+    let mut c = fake_node(
+        t,
+        script,
+        &format!(
+            "cd '{}'\n\"$BIN\" commit -m 'area: c' -- {file}\n",
+            t.repo.display()
+        ),
+    );
+    if let Some(session) = session {
+        c.env("CLAUDE_CODE_SESSION_ID", session);
+    }
+    c.output().unwrap()
+}
+
+#[test]
+fn a_node_running_an_agents_script_is_that_agent() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+    let t = T::new();
+    agents(&t, "gemini");
+    edit_payload(&t, "G", "a.txt");
+    t.write("a.txt", "gemini is editing\n");
+    let mut first = fake_node(
+        &t,
+        "gemini",
+        &format!(
+            "\"$BIN\" hook < \"$PAYLOAD\" > /dev/null || exit 1\necho ready\nread go\ncd '{}'\n\"$BIN\" commit -m 'area: g' -- a.txt > /dev/null 2>&1\necho done $?\n",
+            t.repo.display()
+        ),
+    )
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .spawn()
+    .unwrap();
+    let mut lines = BufReader::new(first.stdout.take().unwrap()).lines();
+    assert_eq!(lines.next().unwrap().unwrap(), "ready");
+
+    let held = t.leases();
+    assert_eq!(held["a.txt"]["pid"], json!(first.id()), "{held}");
+    assert_eq!(held["a.txt"]["start"], json!(lstart(first.id())));
+
+    let other = commit_under(&t, "gemini", None, "a.txt");
+    let err = String::from_utf8_lossy(&other.stderr).into_owned();
+    assert!(!other.status.success(), "{err}");
+    assert!(err.contains("a.txt") && err.contains("--take"), "{err}");
+
+    writeln!(first.stdin.take().unwrap(), "go").unwrap();
+    assert_eq!(lines.next().unwrap().unwrap(), "done 0");
+    first.wait().unwrap();
+    assert_eq!(t.head_file("a.txt"), "gemini is editing\n");
+}
+
+#[test]
+fn a_node_running_another_script_is_no_agent() {
+    let t = T::new();
+    agents(&t, "gemini");
+    edit_payload(&t, "V", "a.txt");
+    let o = fake_node(&t, "vite", "\"$BIN\" hook < \"$PAYLOAD\" > /dev/null\n")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let held = t.leases();
+    assert_eq!(held["a.txt"]["session"], "V", "{held}");
+    assert!(held["a.txt"].get("pid").is_none(), "{held}");
+}
+
+#[test]
+fn the_session_variable_counts_only_for_claude_or_without_an_agent() {
+    let t = T::new();
+    agents(&t, "gemini");
+    for file in ["a.txt", "b.txt"] {
+        assert_eq!(
+            t.hook("X", "Edit", json!({"file_path": t.repo.join(file)})),
+            None
+        );
+        t.write(file, "X is editing\n");
+    }
+    let o = t.run(
+        &["commit", "-m", "area: own", "--", "a.txt"],
+        &[("CLAUDE_CODE_SESSION_ID", Path::new("X"))],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let o = commit_under(&t, "gemini", Some("X"), "b.txt");
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(!o.status.success(), "{err}");
+    assert!(err.contains("b.txt") && err.contains("--take"), "{err}");
+
+    agents(&t, "claude");
+    t.sh(
+        &t.repo,
+        &["git", "config", "--add", "gitmux.agent", "gemini"],
+    );
+    let o = commit_under(&t, "claude", Some("X"), "b.txt");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 }

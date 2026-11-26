@@ -103,7 +103,7 @@ impl Config {
                 .or_else(|| default_slot_dir(root, state.parent().unwrap_or(state)))
                 .unwrap_or_else(|| state.join("slots")),
             agents: if agents.is_empty() {
-                vec!["claude".into(), "codex".into()]
+                vec!["claude".into(), "codex".into(), "gemini".into()]
             } else {
                 agents
             },

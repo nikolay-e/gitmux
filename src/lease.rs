@@ -1,5 +1,5 @@
 use crate::repo::{Repo, now, read_json, write_atomic};
-use crate::run::{Cmd, Result, refuse};
+use crate::run::{Cmd, Result, refuse, refuse_hooks_path_parameter};
 use serde_json::{Map, Value, json};
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashMap};
@@ -8,34 +8,58 @@ use std::sync::OnceLock;
 /// Who is acting: the agent session, for a subagent its id, and the agent process that hosts both.
 pub struct Owner {
     session: Option<String>,
+    ambient: bool,
     agent: Option<String>,
-    process: OnceCell<Map<String, Value>>,
+    process: OnceCell<Found>,
+}
+
+/// The nearest agent ancestor: its recorded identity and the agent it matched in the list.
+struct Found {
+    record: Map<String, Value>,
+    agent: Option<String>,
 }
 
 impl Owner {
     pub fn from_payload(p: &Value) -> Owner {
         let text = |k: &str| p[k].as_str().map(String::from);
-        Owner::new(text("session_id"), text("agent_id"))
+        Owner::new(text("session_id"), text("agent_id"), false)
     }
 
+    /// The session comes from the environment, which every descendant inherits: it counts only
+    /// when no agent but Claude Code stands between this process and that session's shell.
     pub fn of_process() -> Owner {
-        Owner::new(std::env::var("CLAUDE_CODE_SESSION_ID").ok(), None)
+        Owner::new(std::env::var("CLAUDE_CODE_SESSION_ID").ok(), None, true)
     }
 
-    fn new(session: Option<String>, agent: Option<String>) -> Owner {
+    fn new(session: Option<String>, agent: Option<String>, ambient: bool) -> Owner {
         Owner {
             session,
+            ambient,
             agent: agent.filter(|a| !a.is_empty()),
             process: OnceCell::new(),
         }
     }
 
-    fn session(&self) -> &str {
-        self.session.as_deref().unwrap_or("unknown")
+    fn found(&self, agents: &[String]) -> &Found {
+        self.process.get_or_init(|| nearest_agent(agents))
+    }
+
+    fn session_id(&self, agents: &[String]) -> Option<&str> {
+        let nearer_agent = self.ambient
+            && self
+                .found(agents)
+                .agent
+                .as_deref()
+                .is_some_and(|a| a != "claude");
+        self.session.as_deref().filter(|_| !nearer_agent)
+    }
+
+    fn session(&self, agents: &[String]) -> &str {
+        self.session_id(agents).unwrap_or("unknown")
     }
 
     fn process(&self, agents: &[String]) -> &Map<String, Value> {
-        self.process.get_or_init(|| agent_process(agents))
+        &self.found(agents).record
     }
 
     /// Why the lease is another owner's: a different session or two different subagents of one
@@ -43,7 +67,7 @@ impl Owner {
     /// when both have a recorded process and it is the same one.
     fn clash(&self, lease: &Value, agents: &[String]) -> Option<String> {
         let held = lease.get("session")?.as_str()?;
-        if self.session.is_none() {
+        let Some(session) = self.session_id(agents) else {
             let recorded = |m: &Map<String, Value>| {
                 Some((
                     m.get("pid")?.as_i64()?,
@@ -56,8 +80,8 @@ impl Owner {
                 .zip(recorded(self.process(agents)))
                 .is_some_and(|(theirs, mine)| theirs == mine);
             return (!same).then(|| held.to_string());
-        }
-        if held != self.session() {
+        };
+        if held != session {
             return Some(held.to_string());
         }
         if let (Some(mine), Some(theirs)) =
@@ -112,7 +136,7 @@ impl Repo {
         let now = now();
         for p in mine {
             if held.get(p).is_none_or(|l| owner.clash(l, agents).is_some()) {
-                let mut lease = json!({"session": owner.session(), "since": now as i64});
+                let mut lease = json!({"session": owner.session(agents), "since": now as i64});
                 let fields = lease.as_object_mut().unwrap();
                 fields.extend(owner.process(agents).clone());
                 if let Some(agent) = &owner.agent {
@@ -189,26 +213,70 @@ fn processes() -> Option<&'static Processes> {
         .as_ref()
 }
 
-/// A lease records the agent process that took it, so a crashed or closed session's files free
-/// themselves: the holder is gone once no process has that pid with that start time.
-pub fn agent_process(agents: &[String]) -> Map<String, Value> {
-    let Some(table) = processes() else {
-        return Map::new();
+/// pid → the script a `node` process runs, as a basename without its extension: the first
+/// argument after node's own options. Read only when an ancestor is `node`.
+fn node_scripts() -> &'static HashMap<i64, String> {
+    static TABLE: OnceLock<HashMap<i64, String>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let Ok(out) = Cmd::new("ps").args(["-A", "-o", "pid=,args="]).out() else {
+            return HashMap::new();
+        };
+        let mut table = HashMap::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut words = line.split_whitespace();
+            let Some(Ok(pid)) = words.next().map(str::parse) else {
+                continue;
+            };
+            let Some(script) = words.skip(1).find(|w| !w.starts_with('-')) else {
+                continue;
+            };
+            let file = script.rsplit('/').next().unwrap_or(script);
+            let stem = [".js", ".mjs", ".cjs"]
+                .iter()
+                .find_map(|ext| file.strip_suffix(ext))
+                .unwrap_or(file);
+            table.insert(pid, stem.to_string());
+        }
+        table
+    })
+}
+
+fn nearest_agent(agents: &[String]) -> Found {
+    let none = Found {
+        record: Map::new(),
+        agent: None,
     };
+    let Some(table) = processes() else {
+        return none;
+    };
+    let named = |name: &str| agents.iter().find(|a| *a == name);
     let mut pid = std::os::unix::process::parent_id() as i64;
     while pid > 1 {
         let Some((ppid, start, name)) = table.get(&pid) else {
             break;
         };
-        if agents.iter().any(|a| a == name) {
-            let mut m = Map::new();
-            m.insert("pid".into(), json!(pid));
-            m.insert("start".into(), json!(start));
-            return m;
+        let agent = named(name).or_else(|| {
+            let script = (name == "node").then(|| node_scripts().get(&pid))??;
+            named(script)
+        });
+        if let Some(agent) = agent {
+            let mut record = Map::new();
+            record.insert("pid".into(), json!(pid));
+            record.insert("start".into(), json!(start));
+            return Found {
+                record,
+                agent: Some(agent.clone()),
+            };
         }
         pid = *ppid;
     }
-    Map::new()
+    none
+}
+
+/// A lease records the agent process that took it, so a crashed or closed session's files free
+/// themselves: the holder is gone once no process has that pid with that start time.
+pub fn agent_process(agents: &[String]) -> Map<String, Value> {
+    nearest_agent(agents).record
 }
 
 /// A holder with no recorded process, or a machine whose process table cannot be read, counts as
@@ -226,6 +294,7 @@ pub fn alive(lease: &Value) -> bool {
 
 /// Refuses paths another live owner holds, unless the caller was told to take them over.
 pub fn refuse_foreign(repo: &Repo, paths: &[String], owner: &Owner, take: bool) -> Result<()> {
+    refuse_hooks_path_parameter()?;
     if take {
         return Ok(());
     }

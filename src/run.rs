@@ -63,6 +63,7 @@ impl Cmd {
             .current_dir(dir)
             .env("GIT_LITERAL_PATHSPECS", "1")
             .env_remove("GIT_INDEX_FILE");
+        drop_injected_hooks_path(&mut c.cmd);
         c
     }
 
@@ -160,6 +161,72 @@ impl Cmd {
             .map_err(|e| Refused(format!("{}: {e}", self.label)))?;
         Ok(s.success())
     }
+}
+
+fn is_hooks_path(key: &str) -> bool {
+    key.eq_ignore_ascii_case("core.hookspath")
+}
+
+/// An agent that injects `core.hooksPath` through GIT_CONFIG_COUNT/KEY_n/VALUE_n (Gemini CLI
+/// sets it empty) would switch off the repository's hooks, which are what verify a candidate.
+/// Git-mux's git commands get the other pairs, renumbered; the agent's own commands keep all.
+fn drop_injected_hooks_path(cmd: &mut Command) {
+    let var = |k: String| std::env::var(k).ok();
+    let Some(count) = var("GIT_CONFIG_COUNT".into()).and_then(|n| n.parse::<usize>().ok()) else {
+        return;
+    };
+    let pairs: Vec<(Option<String>, Option<String>)> = (0..count)
+        .map(|i| {
+            (
+                var(format!("GIT_CONFIG_KEY_{i}")),
+                var(format!("GIT_CONFIG_VALUE_{i}")),
+            )
+        })
+        .collect();
+    if !pairs
+        .iter()
+        .any(|(k, _)| k.as_deref().is_some_and(is_hooks_path))
+    {
+        return;
+    }
+    let kept: Vec<_> = pairs
+        .into_iter()
+        .filter(|(k, _)| !k.as_deref().is_some_and(is_hooks_path))
+        .collect();
+    cmd.env("GIT_CONFIG_COUNT", kept.len().to_string());
+    for i in 0..count {
+        match kept.get(i) {
+            Some((key, value)) => {
+                cmd.env(format!("GIT_CONFIG_KEY_{i}"), key.as_deref().unwrap_or(""));
+                cmd.env(
+                    format!("GIT_CONFIG_VALUE_{i}"),
+                    value.as_deref().unwrap_or(""),
+                );
+            }
+            None => {
+                cmd.env_remove(format!("GIT_CONFIG_KEY_{i}"));
+                cmd.env_remove(format!("GIT_CONFIG_VALUE_{i}"));
+            }
+        }
+    }
+}
+
+/// `git -c core.hooksPath=… mux commit` reaches git-mux through GIT_CONFIG_PARAMETERS, which
+/// every git command inherits and git-mux cannot cleanly edit: the commit is refused instead.
+pub fn refuse_hooks_path_parameter() -> Result<()> {
+    let Ok(parameters) = std::env::var("GIT_CONFIG_PARAMETERS") else {
+        return Ok(());
+    };
+    let quoted = parameters.split('\'').skip(1).step_by(2);
+    for item in quoted {
+        let key = item.split('=').next().unwrap_or(item);
+        if is_hooks_path(key) {
+            refuse!(
+                "core.hooksPath is set for this command (git -c core.hooksPath=…); git-mux verifies a commit with the repository's own hooks, so run it without that option"
+            );
+        }
+    }
+    Ok(())
 }
 
 pub fn zsplit(s: &str) -> Vec<String> {
