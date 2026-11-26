@@ -61,7 +61,10 @@ fn is_ours(hook: &Value) -> bool {
         .is_some_and(|c| c.contains("git-mux"))
 }
 
-fn read_config(file: &Path) -> Result<Value> {
+/// One settings file, refused by name when git-mux could not edit it without losing something: it
+/// does not parse, its top level is not an object, `hooks` is present and not an object, or one of
+/// `events` holds a value that is not an array. A missing file is an empty one.
+fn read_config(file: &Path, events: &[&str]) -> Result<Value> {
     let Ok(data) = fs::read(file) else {
         return Ok(json!({}));
     };
@@ -69,6 +72,17 @@ fn read_config(file: &Path) -> Result<Value> {
         .map_err(|e| crate::run::Refused(format!("{}: {e}", file.display())))?;
     if !config.is_object() {
         refuse!("{}: the top level is not a JSON object", file.display());
+    }
+    let Some(hooks) = config.get("hooks") else {
+        return Ok(config);
+    };
+    let Some(wired) = hooks.as_object() else {
+        refuse!("{}: hooks is not a JSON object", file.display());
+    };
+    for event in events {
+        if wired.get(*event).is_some_and(|groups| !groups.is_array()) {
+            refuse!("{}: hooks.{event} is not a JSON array", file.display());
+        }
     }
     Ok(config)
 }
@@ -107,23 +121,19 @@ fn strip_ours(config: &mut Value) {
 
 /// Replaces any earlier git-mux entry in one hook config with `hook` on each of `events`.
 fn wire(file: &Path, events: &[(&str, Option<&str>)], hook: &Value) -> Result<bool> {
-    let mut config = read_config(file)?;
+    let mut config = read_config(file, &names(events))?;
     let before = config.clone();
     strip_ours(&mut config);
-    let root = config.as_object_mut().unwrap();
-    if !root.get("hooks").is_some_and(Value::is_object) {
-        root.insert("hooks".into(), json!({}));
-    }
-    let wired = root
-        .get_mut("hooks")
-        .and_then(Value::as_object_mut)
+    let wired = config
+        .as_object_mut()
+        .unwrap()
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
         .unwrap();
     for (event, matcher) in events {
-        let slot = wired.entry(*event).or_insert(Value::Null);
-        if !slot.is_array() {
-            *slot = json!([]);
-        }
-        slot.as_array_mut().unwrap().push(match matcher {
+        let groups = wired.entry(*event).or_insert_with(|| json!([]));
+        groups.as_array_mut().unwrap().push(match matcher {
             Some(m) => json!({"matcher": m, "hooks": [hook]}),
             None => json!({"hooks": [hook]}),
         });
@@ -136,11 +146,11 @@ fn wire(file: &Path, events: &[(&str, Option<&str>)], hook: &Value) -> Result<bo
 }
 
 /// Takes git-mux out of one hook config, leaving every other handler and key.
-fn unwire(file: &Path) -> Result<bool> {
+fn unwire(file: &Path, events: &[(&str, Option<&str>)]) -> Result<bool> {
     if !file.is_file() {
         return Ok(false);
     }
-    let mut config = read_config(file)?;
+    let mut config = read_config(file, &names(events))?;
     let before = config.clone();
     strip_ours(&mut config);
     if config == before {
@@ -160,6 +170,10 @@ fn unwire(file: &Path) -> Result<bool> {
         write_config(file, &config)?;
     }
     Ok(true)
+}
+
+fn names<'a>(events: &[(&'a str, Option<&str>)]) -> Vec<&'a str> {
+    events.iter().map(|(event, _)| *event).collect()
 }
 
 fn quoted(path: &Path) -> String {
@@ -246,19 +260,20 @@ fn project_file(repo: &Repo) -> PathBuf {
     repo.main_root().join(".claude/settings.local.json")
 }
 
+const PROJECT_EVENTS: [(&str, Option<&str>); 4] = [
+    ("PreToolUse", Some("Bash|Edit|Write|MultiEdit|NotebookEdit")),
+    ("PostToolUse", Some("Bash")),
+    ("PostToolUseFailure", Some("Bash")),
+    ("PermissionDenied", Some("Bash")),
+];
+
 /// The checkout's own Claude Code settings, which no clone shares: it holds the binary's absolute
 /// path. Exec form with `onFailure: "block"`, so a hook that cannot run refuses the call here
 /// while every other project stays open. Git is told to ignore the file.
 fn wire_project(repo: &Repo, exe: &Path) -> Result<()> {
     let file = project_file(repo);
     let hook = json!({"type": "command", "command": exe, "args": ["hook"], "onFailure": "block", "timeout": 30});
-    let events = [
-        ("PreToolUse", Some("Bash|Edit|Write|MultiEdit|NotebookEdit")),
-        ("PostToolUse", Some("Bash")),
-        ("PostToolUseFailure", Some("Bash")),
-        ("PermissionDenied", Some("Bash")),
-    ];
-    let changed = wire(&file, &events, &hook)?;
+    let changed = wire(&file, &PROJECT_EVENTS, &hook)?;
     let checked = Cmd::git(&repo.main_root())
         .env_remove("GIT_LITERAL_PATHSPECS")
         .args(["check-ignore", "-q", "--", ".claude/settings.local.json"])
@@ -332,24 +347,52 @@ pub fn install(repo: &Repo, project: bool) -> Result<()> {
     Ok(())
 }
 
+/// The settings files `install` would write, read before anything else changes: an invalid one
+/// refuses the install with the checkout not enrolled.
+pub fn validate_install(repo: &Repo, project: bool) -> Result<()> {
+    for agent in agents() {
+        read_config(&agent.file, &names(&agent.events))?;
+    }
+    if project {
+        read_config(&project_file(repo), &names(&PROJECT_EVENTS))?;
+    }
+    Ok(())
+}
+
+fn remaining_roots(repo: &Repo) -> Vec<PathBuf> {
+    let root = repo.main_root();
+    registered_roots()
+        .into_iter()
+        .filter(|r| *r != root && r.is_dir())
+        .collect()
+}
+
+/// The settings files `uninstall` would edit, read before the guards, slots and registry go.
+pub fn validate_uninstall(repo: &Repo) -> Result<()> {
+    read_config(&project_file(repo), &names(&PROJECT_EVENTS))?;
+    if remaining_roots(repo).is_empty() {
+        for agent in agents() {
+            read_config(&agent.file, &names(&agent.events))?;
+        }
+    }
+    Ok(())
+}
+
 /// `git mux uninstall`: the checkout leaves git-mux (guards, slots, state, project hooks,
 /// registry entry); the agents' hooks go with the last checkout.
 pub fn uninstall(repo: &Repo) -> Result<()> {
     guard::remove(repo)?;
     slot::remove_all(repo)?;
-    if unwire(&project_file(repo))? {
+    if unwire(&project_file(repo), &PROJECT_EVENTS)? {
         println!("git-mux: project hooks removed");
     }
     fs::remove_dir_all(&repo.state)?;
     let root = repo.main_root();
-    let remaining: Vec<PathBuf> = registered_roots()
-        .into_iter()
-        .filter(|r| *r != root && r.is_dir())
-        .collect();
+    let remaining = remaining_roots(repo);
     save_registry(&remaining)?;
     if remaining.is_empty() {
         for agent in agents() {
-            if unwire(&agent.file)? {
+            if unwire(&agent.file, &agent.events)? {
                 println!(
                     "git-mux: {} hooks removed from {}",
                     agent.name,

@@ -600,3 +600,83 @@ fn a_settings_file_whose_top_level_is_not_an_object_is_refused_by_name() {
     assert!(err.contains(&*file.to_string_lossy()), "{err}");
     assert_eq!(fs::read_to_string(&file).unwrap(), "[]");
 }
+
+fn second_checkout(t: &T) -> PathBuf {
+    let second = t.tmp.join("second");
+    fs::create_dir_all(&second).unwrap();
+    t.sh(&second, &["git", "init", "-q", "-b", "main"]);
+    second
+}
+
+fn refused_install(t: &T, second: &Path, file: &Path, key: &str) {
+    let o = cmd(BIN, &t.tmp)
+        .arg("install")
+        .current_dir(second)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success(), "{err}");
+    assert!(err.contains(&*file.to_string_lossy()), "{err}");
+    assert!(err.contains(key), "{err}");
+    let registry = fs::read_to_string(t.tmp.join("config/gitmux/repos")).unwrap();
+    assert_eq!(registry, format!("{}\n", t.repo.display()), "not enrolled");
+    assert!(!second.join(".git/gitmux").exists());
+    assert!(!second.join(".git/hooks/reference-transaction").exists());
+}
+
+#[test]
+fn install_refuses_a_hooks_value_that_is_not_an_object_before_it_changes_anything() {
+    let t = T::new();
+    let home = t.tmp.join("home");
+    let second = second_checkout(&t);
+    fs::create_dir_all(home.join(".gemini")).unwrap();
+    let gemini = home.join(".gemini/settings.json");
+    fs::write(&gemini, r#"{"hooks": []}"#).unwrap();
+    let claude = home.join(".claude/settings.json");
+    fs::write(&claude, r#"{"model": "x"}"#).unwrap();
+    refused_install(&t, &second, &gemini, "hooks");
+    assert_eq!(fs::read_to_string(&gemini).unwrap(), r#"{"hooks": []}"#);
+    assert_eq!(fs::read_to_string(&claude).unwrap(), r#"{"model": "x"}"#);
+}
+
+#[test]
+fn install_refuses_an_event_that_is_not_a_list_before_it_changes_anything() {
+    let t = T::new();
+    let home = t.tmp.join("home");
+    let second = second_checkout(&t);
+    let claude = home.join(".claude/settings.json");
+    let theirs = r#"{"hooks": {"PreToolUse": "x"}}"#;
+    fs::write(&claude, theirs).unwrap();
+    let codex = home.join(".codex/hooks.json");
+    fs::write(&codex, "{}").unwrap();
+    refused_install(&t, &second, &claude, "PreToolUse");
+    assert_eq!(fs::read_to_string(&claude).unwrap(), theirs);
+    assert_eq!(fs::read_to_string(&codex).unwrap(), "{}");
+}
+
+#[test]
+fn uninstall_validates_every_settings_file_before_it_removes_anything() {
+    let t = T::new();
+    let claude = t.tmp.join("home/.claude/settings.json");
+    t.write("a.txt", "a2\n");
+    t.mux(&["commit", "-m", "t: a", "a.txt"]);
+    let slot = t.tmp.join("slots/mux-verify-0");
+    assert!(slot.exists());
+    fs::write(&claude, "{ // comment\n}").unwrap();
+    let o = t.run(&["uninstall"], &[]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success(), "{err}");
+    assert!(err.contains(&*claude.to_string_lossy()), "{err}");
+    let guard = fs::read_to_string(t.repo.join(".git/hooks/pre-commit")).unwrap();
+    assert!(guard.contains("git-mux"), "the guard line stays");
+    assert_eq!(
+        fs::read_to_string(t.tmp.join("config/gitmux/repos")).unwrap(),
+        format!("{}\n", t.repo.display())
+    );
+    assert!(slot.exists() && t.state().exists());
+    assert_eq!(fs::read_to_string(&claude).unwrap(), "{ // comment\n}");
+    fs::write(&claude, "{}").unwrap();
+    t.mux(&["uninstall"]);
+    assert!(!t.tmp.join("config/gitmux/repos").exists());
+    assert!(!slot.exists() && !t.state().exists());
+}

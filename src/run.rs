@@ -211,8 +211,8 @@ fn drop_injected_hooks_path(cmd: &mut Command) {
     }
 }
 
-/// `git -c core.hooksPath=… mux commit` reaches git-mux through GIT_CONFIG_PARAMETERS, which
-/// every git command inherits and git-mux cannot cleanly edit: the commit is refused instead.
+/// `git -c core.hooksPath=… mux <command>` reaches git-mux through GIT_CONFIG_PARAMETERS, which
+/// every git command inherits and git-mux cannot cleanly edit: every command but `hook` refuses.
 pub fn refuse_hooks_path_parameter() -> Result<()> {
     let Ok(parameters) = std::env::var("GIT_CONFIG_PARAMETERS") else {
         return Ok(());

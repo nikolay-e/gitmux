@@ -92,6 +92,11 @@ fn run(args: &[String]) -> Result<()> {
     };
     run::refuse_hooks_path_parameter()?;
     let repo = repo::Repo::open(&std::env::current_dir()?)?;
+    match cmd {
+        "install" => install::validate_install(&repo, project)?,
+        "uninstall" => install::validate_uninstall(&repo)?,
+        _ => {}
+    }
     if cmd != "uninstall" {
         let notes = install::ensure(&repo, cmd == "install")?;
         if matches!(cmd, "install" | "status") {
