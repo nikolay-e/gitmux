@@ -465,11 +465,9 @@ impl Scan {
                         .is_some_and(|w| w.lead == w.text.len() && redirect_of(w).is_some());
                     self.functions |= !f.words.is_empty() && !process_substitution;
                     self.list(f.st.clone(), depth + 1, true)?;
-                    if process_substitution {
-                        let mut w = Word::default();
-                        w.unknown("<(_)");
-                        f.words.push(w);
-                    }
+                    let mut w = Word::default();
+                    w.unknown(if process_substitution { "<(_)" } else { "(_)" });
+                    f.words.push(w);
                 }
                 ')' => {
                     let first = f.words.first().map(|w| w.text.as_str());
