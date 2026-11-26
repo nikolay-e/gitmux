@@ -1,7 +1,7 @@
 # git-mux
 
-Several coding agents (Claude Code, Codex, …) editing **one checkout, on one branch, at the same
-time** — and committing without wiping out each other's work.
+Several coding agents (Claude Code, Codex, Gemini CLI) editing **one checkout, on one branch, at
+the same time** — and committing without wiping out each other's work.
 
 Plain `git commit` breaks down there:
 
@@ -29,10 +29,10 @@ git-mux is one static binary that replaces those paths.
 - **`git mux sync`** does the replay alone. It refuses, and leaves the checkout as it is, when an
   incoming file is edited or staged there. **`git mux status`** shows which agent holds which
   uncommitted file.
-- **Agent hooks** (`git mux hook`, wired by `git mux install`) refuse destructive git commands
-  in the shared checkout before they run, give each file an owner (a *lease*) when an agent
-  edits it, refuse another agent's edit or commit of a leased file, and attribute files a shell
-  command wrote.
+- **Agent hooks** (`git mux hook [gemini]`, wired by `git mux install`) refuse destructive git
+  commands in the shared checkout before they run, give each file an owner (a *lease*) when an
+  agent edits it, refuse another agent's edit or commit of a leased file, and attribute files a
+  shell command wrote.
 - An interrupted commit or sync is finished by the next run.
 
 Any hook manager works — pre-commit, husky, lefthook, plain scripts — because git-mux runs
@@ -77,8 +77,13 @@ git mux --version
 `git mux install` enrolls the repository, installs the git guards, and wires the user-level hooks
 of every agent whose config directory exists, keeping your other hooks. Claude Code's file is
 `$CLAUDE_CONFIG_DIR/settings.json` when that variable is set, else `~/.claude/settings.json`;
-Codex's is `$CODEX_HOME/hooks.json` when set, else `~/.codex/hooks.json`. Run `uninstall` with
-the same environment. Codex runs a changed hook only after you trust it once with `/hooks`.
+Codex's is `$CODEX_HOME/hooks.json` when set, else `~/.codex/hooks.json`; Gemini CLI's is
+`$GEMINI_CLI_HOME/.gemini/settings.json` when set, else `~/.gemini/settings.json`. Run `uninstall`
+with the same environment. Codex runs a changed hook only after you trust it once with `/hooks`.
+Gemini gets `BeforeTool` (shell, `write_file`, `replace`), `AfterTool` (shell), `AfterAgent`,
+`SessionStart` and `SessionEnd`, all through the handler `git-mux hook gemini`. Gemini runs hooks,
+user-level ones too, only in folders it trusts, and folder trust is on by default: trust each
+enrolled checkout in Gemini, or git-mux's guard does not run there (`install` says so).
 Only `install` enrolls a checkout; any other `git mux` command merely repairs the guards of one
 that is already enrolled.
 
@@ -123,7 +128,7 @@ Two layers, independent of each other, so that a gap in one does not open the ot
 - A hooks directory that git tracks is never edited. `git mux install` prints the lines to add
   instead, and the `reference-transaction` guard is not installed there.
 
-**The agent hook**, for Claude Code and Codex, in every enrolled checkout:
+**The agent hook**, for Claude Code, Codex and Gemini CLI, in every enrolled checkout:
 
 - `git commit`, `git push`, `git stash`, `git reset`, `git clean`, `git rebase`, `git merge`,
   branch switches, broad `add`/`checkout`/`restore`/`rm` and the like are refused before they
@@ -137,19 +142,31 @@ Two layers, independent of each other, so that a gap in one does not open the ot
   or before `;` counts when DIR is an existing literal path and no `if`, loop, `case`, function or
   `||` makes it conditional. Otherwise the directory is unknown, the command counts as the
   checkout the shell is in, and the refusal says so.
-- A *lease* belongs to a session, a subagent of it and the agent process hosting both. Another
+- A *lease* belongs to a session, a subagent of it and the agent process hosting both. An agent
+  process is one whose executable, or the script `node` runs (Gemini CLI), is named in
+  `gitmux.agent`; `CLAUDE_CODE_SESSION_ID` names the session only when Claude Code is the nearest
+  agent, and under Codex or Gemini the caller is judged by its process alone. Another
   session's edit or `git mux commit` of a leased file is refused; two subagents of one session
   hold leases against each other. A lease ends when its file equals `HEAD` again, when its agent
   process or session ends, and a finished subagent hands its files to its session. `git mux
   commit --take` takes files over when their holder agreed.
 - A crash, a git error or an unreadable payload that names an enrolled checkout refuses the call
-  (exit 2); lifecycle events such as `Stop` never refuse. The hook installed for your user exits
-  0 when the binary is missing, so other projects are never blocked; the project hook of
-  `--project` (`onFailure: "block"`, Claude Code 2.1.295 or newer) blocks the call in that
-  checkout when the hook cannot run. Codex's handling of a hook that cannot run is undocumented:
-  treat Codex as fail-open. Input sent to a running command with Codex's `write_stdin`, for example
-  into an interactive shell it started, does not pass `PreToolUse`, so only the git-level guards
-  apply to it.
+  (exit 2). Only a call can be refused: a failure on any other event (`Stop`, `AfterAgent`,
+  `PostToolUse`, `SessionStart`, …) is reported on stderr and the agent goes on. The hook installed
+  for your user exits 0 when the binary is missing, so other projects are never blocked; the
+  project hook of `--project` (`onFailure: "block"`, Claude Code 2.1.295 or newer) blocks the call
+  in that checkout when the hook cannot run. Codex's handling of a hook that cannot run is
+  undocumented: treat Codex as fail-open. Under Gemini a missing binary passes and a refusal or a
+  crash refuses the call; a timeout, `/hooks disable` or an untrusted folder lets calls through.
+  Input sent to a running command with Codex's `write_stdin`, for example into an interactive
+  shell it started, does not pass `PreToolUse`, so only the git-level guards apply to it.
+
+**Under Gemini CLI** git runs none of the repository's hooks for the commands Gemini starts,
+because Gemini empties `core.hooksPath` for them: the git-level guards above do not fire, only the
+hook guard refuses, and a git call it cannot see, such as one inside a script or a program, is not
+refused. `git mux commit` and `git mux push` still run the repository's hooks, because git-mux
+drops an injected hooks path. Gemini also empties `credential.helper` for its commands, so a push
+from Gemini cannot use a credential helper.
 
 **Known limits**: a *configured* hook (`hook.<name>.event`, git 2.54 and newer) is the one commit
 or push hook that can run in the live tree: it runs before any hook file and cannot be stopped by
@@ -168,7 +185,7 @@ file (same syntax):
 | `gitmux.slots` | `2` | verification worktrees, i.e. commits verified at once |
 | `gitmux.slotDir` | `${XDG_CACHE_HOME:-~/.cache}/gitmux/slots/<name>-<8 hex>` | where they live (`~` expands; relative to the checkout) |
 | `gitmux.slotSetup` | unset | shell command run in each slot before the hooks, with `GITMUX_LIVE` (the checkout) and `GITMUX_SLOT` set; a failure refuses the commit or push |
-| `gitmux.agent` | `claude`, `codex` | process names whose lifetime bounds a lease (multi-valued) |
+| `gitmux.agent` | `claude`, `codex`, `gemini` | agents whose lifetime bounds a lease: an executable's name, or the script `node` runs (Gemini CLI); multi-valued |
 | `gitmux.components` | `components.json` | optional monorepo map; a lost race re-verifies only when the other commit touched a component this one depends on |
 | `gitmux.selfInstall` | unset | path of this crate inside the repository: a commit landed by `git mux commit` that touches it rebuilds and replaces the running binary |
 
