@@ -1,5 +1,6 @@
-//! The Claude Code / Codex tool and session hook. Exit 2 with the reason on stderr is the one
-//! blocking signal both honour, so a refusal and a crash both end that way.
+//! The Claude Code, Codex and Gemini CLI tool and session hook. Exit 2 with the reason on stderr
+//! is the one blocking signal all three honour, so where a call can be refused a refusal and a
+//! crash both end that way; any other event reports on stderr and lets the agent go on.
 use crate::commit::expand;
 use crate::install::registered_roots;
 use crate::lease::{self, Owner, agent_process, alive, holder, short};
@@ -8,11 +9,14 @@ use crate::run::{Result, zsplit};
 use crate::shell::{Kind, argv_invocations, commit_paths, guard_in, invocations, patch_paths};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::OnceLock;
 
 const EDIT_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit", "apply_patch"];
 const SNAPSHOTS: usize = 8;
@@ -94,31 +98,117 @@ fn names_git(command: &str) -> bool {
         .any(|w| w == "git" || w == "git-mux")
 }
 
-pub fn main() -> ExitCode {
+static EVENT: OnceLock<String> = OnceLock::new();
+
+/// The exit code of a crash: 2 where the event can refuse a call (and before the event is known),
+/// 0 elsewhere, where exit 2 would keep a Claude Code or Codex agent working past Stop, make
+/// Gemini retry after AfterAgent, hide a command's output on AfterTool, or call an already run
+/// command refused.
+pub fn crash_code() -> i32 {
+    if EVENT.get().is_some_and(|e| reports_only(e)) {
+        0
+    } else {
+        2
+    }
+}
+
+fn reports_only(event: &str) -> bool {
+    matches!(
+        event,
+        "PostToolUse"
+            | "PostToolUseFailure"
+            | "AfterTool"
+            | "PermissionDenied"
+            | "Stop"
+            | "AfterAgent"
+            | "Interrupt"
+            | "SubagentStop"
+            | "SessionStart"
+            | "SessionEnd"
+    )
+}
+
+/// Gemini CLI's payload in the vocabulary the handlers speak. The agent's own event name stays
+/// for output; None for an event git-mux has no use for.
+fn from_gemini(mut p: Value) -> Option<Value> {
+    let event = match p["hook_event_name"].as_str()? {
+        "BeforeTool" => "PreToolUse",
+        "AfterTool" => "PostToolUse",
+        "AfterAgent" => "Stop",
+        e @ ("SessionStart" | "SessionEnd") => e,
+        _ => return None,
+    };
+    p["hook_event_name"] = json!(event);
+    let tool = match p["tool_name"].as_str() {
+        Some("run_shell_command") => "Bash",
+        Some("write_file") => "Write",
+        Some("replace") => "Edit",
+        _ => return Some(p),
+    };
+    if tool == "Bash" {
+        // Gemini sends no call id: BeforeTool and AfterTool of one call carry the same input.
+        let mut hasher = DefaultHasher::new();
+        p["tool_name"].to_string().hash(&mut hasher);
+        p["tool_input"].to_string().hash(&mut hasher);
+        p["tool_use_id"] = json!(format!("gemini-{:016x}", hasher.finish()));
+        if let Some(dir) = p["tool_input"]["dir_path"]
+            .as_str()
+            .filter(|d| !d.is_empty())
+        {
+            let cwd = p["cwd"].as_str().map_or_else(PathBuf::new, PathBuf::from);
+            p["cwd"] = json!(normalize(&cwd.join(dir)));
+        }
+    }
+    p["tool_name"] = json!(tool);
+    Some(p)
+}
+
+pub fn main(gemini: bool) -> ExitCode {
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
     let roots = live_roots();
     if roots.is_empty() {
         return ExitCode::SUCCESS;
     }
-    let payload = match serde_json::from_str::<Value>(&raw) {
+    let mut payload = match serde_json::from_str::<Value>(&raw) {
         Ok(p) => p,
         Err(e) if roots.iter().any(|r| r.mentioned_in(&raw)) => {
             return refuse(&format!("unreadable hook payload: {e}"));
         }
         Err(_) => return ExitCode::SUCCESS,
     };
-    let event = payload["hook_event_name"].as_str().unwrap_or("");
-    match handle(&payload, event, &roots) {
+    let agent_event = payload["hook_event_name"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let _ = EVENT.set(agent_event.clone());
+    if gemini {
+        match from_gemini(payload) {
+            Some(p) => payload = p,
+            None => return ExitCode::SUCCESS,
+        }
+    }
+    let event = payload["hook_event_name"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    match handle(&payload, &event, &roots) {
         Ok(Decision::Allow) => ExitCode::SUCCESS,
         Ok(Decision::Say(text)) => {
-            println!("{text}");
+            if gemini {
+                println!(
+                    "{}",
+                    json!({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}})
+                );
+            } else {
+                println!("{text}");
+            }
             ExitCode::SUCCESS
         }
         Ok(Decision::Note(text)) => {
             println!(
                 "{}",
-                json!({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}})
+                json!({"hookSpecificOutput": {"hookEventName": agent_event, "additionalContext": text}})
             );
             ExitCode::SUCCESS
         }
@@ -126,10 +216,8 @@ pub fn main() -> ExitCode {
             eprintln!("git-mux: {reason}");
             ExitCode::from(2)
         }
-        // Exit 2 on Stop keeps the agent working, and the other lifecycle events cannot refuse
-        // anything: housekeeping that fails is reported and the agent goes on.
-        Err(e) if is_lifecycle(event) => {
-            eprintln!("git-mux: {event} housekeeping failed: {e}");
+        Err(e) if reports_only(&agent_event) => {
+            eprintln!("git-mux: {agent_event} hook failed: {e}");
             ExitCode::SUCCESS
         }
         Err(e) => refuse(&e.to_string()),
@@ -139,13 +227,6 @@ pub fn main() -> ExitCode {
 fn refuse(why: &str) -> ExitCode {
     eprintln!("git-mux: the shared-checkout guard failed, so the call is refused: {why}");
     ExitCode::from(2)
-}
-
-fn is_lifecycle(event: &str) -> bool {
-    matches!(
-        event,
-        "PermissionDenied" | "Stop" | "Interrupt" | "SubagentStop" | "SessionStart" | "SessionEnd"
-    )
 }
 
 fn handle(p: &Value, event: &str, roots: &[Root]) -> Result<Decision> {

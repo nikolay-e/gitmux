@@ -31,7 +31,11 @@ pub static N: AtomicUsize = AtomicUsize::new(0);
 pub fn cmd(program: &str, tmp: &Path) -> Command {
     let mut c = Command::new(program);
     for (k, _) in std::env::vars() {
-        if k.starts_with("GIT_") || k.starts_with("CLAUDE") || k.starts_with("CODEX") {
+        if k.starts_with("GIT_")
+            || k.starts_with("CLAUDE")
+            || k.starts_with("CODEX")
+            || k.starts_with("GEMINI")
+        {
             c.env_remove(k);
         }
     }

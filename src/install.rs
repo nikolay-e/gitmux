@@ -151,6 +151,8 @@ fn quoted(path: &Path) -> String {
 struct Agent {
     name: &'static str,
     file: PathBuf,
+    /// Gemini CLI: its own dialect (`hook gemini`), and a timeout in milliseconds.
+    gemini: bool,
     events: Vec<(&'static str, Option<&'static str>)>,
 }
 
@@ -164,11 +166,13 @@ fn config_file(var: &str, default_dir: &str, name: &str) -> Option<PathBuf> {
     Some(dir.join(name))
 }
 
-/// Claude Code and Codex, for those whose config file resolves and whose directory exists.
+/// Claude Code, Codex and Gemini CLI, for those whose config file resolves and whose directory
+/// exists.
 fn agents() -> Vec<Agent> {
     let claude = config_file("CLAUDE_CONFIG_DIR", ".claude", "settings.json").map(|file| Agent {
         name: "Claude Code",
         file,
+        gemini: false,
         events: vec![
             ("PreToolUse", Some("Bash|Edit|Write|MultiEdit|NotebookEdit")),
             ("PostToolUse", Some("Bash")),
@@ -183,6 +187,7 @@ fn agents() -> Vec<Agent> {
     let codex = config_file("CODEX_HOME", ".codex", "hooks.json").map(|file| Agent {
         name: "Codex",
         file,
+        gemini: false,
         events: vec![
             ("PreToolUse", Some("^(Bash|apply_patch|Edit|Write)$")),
             ("PostToolUse", Some("^Bash$")),
@@ -192,7 +197,27 @@ fn agents() -> Vec<Agent> {
             ("SessionEnd", None),
         ],
     });
-    [claude, codex]
+    // GEMINI_CLI_HOME replaces the home directory, so `.gemini` stays under it.
+    let gemini = std::env::var_os("GEMINI_CLI_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .map(|home| Agent {
+            name: "Gemini CLI",
+            file: home.join(".gemini/settings.json"),
+            gemini: true,
+            events: vec![
+                (
+                    "BeforeTool",
+                    Some("^(run_shell_command|write_file|replace)$"),
+                ),
+                ("AfterTool", Some("^run_shell_command$")),
+                ("AfterAgent", None),
+                ("SessionStart", None),
+                ("SessionEnd", None),
+            ],
+        });
+    [claude, codex, gemini]
         .into_iter()
         .flatten()
         .filter(|a| a.file.parent().is_some_and(Path::is_dir))
@@ -251,11 +276,14 @@ fn wire_project(repo: &Repo, exe: &Path) -> Result<()> {
 /// are `ensure`'s.
 pub fn install(repo: &Repo, project: bool) -> Result<()> {
     let exe = std::env::current_exe()?;
-    // A missing binary lets the call through everywhere but in a checkout with the project hook.
-    let command = format!("[ -x {0} ] || exit 0; exec {0} hook", quoted(&exe));
-    let hook =
-        json!({"type": "command", "command": command, "timeout": 30, "statusMessage": "git-mux"});
     for agent in agents() {
+        // A missing binary lets the call through everywhere but in a checkout with the project hook.
+        let command = |args: &str| format!("[ -x {0} ] || exit 0; exec {0} {args}", quoted(&exe));
+        let hook = if agent.gemini {
+            json!({"type": "command", "command": command("hook gemini"), "name": "git-mux", "timeout": 30000})
+        } else {
+            json!({"type": "command", "command": command("hook"), "timeout": 30, "statusMessage": "git-mux"})
+        };
         let changed = wire(&agent.file, &agent.events, &hook)?;
         println!(
             "git-mux: {} hooks in {} {}",
@@ -269,6 +297,11 @@ pub fn install(repo: &Repo, project: bool) -> Result<()> {
         );
         if changed && agent.name == "Codex" {
             println!("git-mux: Codex runs a changed hook only after you trust it once with /hooks");
+        }
+        if agent.gemini {
+            println!(
+                "git-mux: Gemini CLI runs hooks only in folders it trusts: trust this checkout in Gemini, or git-mux's guard does not run there"
+            );
         }
     }
     if project {

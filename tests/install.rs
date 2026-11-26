@@ -434,3 +434,116 @@ fn an_empty_variable_or_a_missing_directory_wires_nothing_else() {
     assert!(!home.join(".codex/hooks.json").exists());
     assert!(!missing.exists());
 }
+
+fn gemini_settings() -> Value {
+    json!({"theme": "dark", "hooks": {"BeforeTool": [{"matcher": "^mcp_", "hooks": [
+        {"type": "command", "command": "/opt/other-guard", "name": "other"}]}]}})
+}
+
+#[test]
+fn install_wires_gemini_cli_and_uninstall_takes_only_its_entries() {
+    let t = T::new();
+    let home = t.tmp.join("home");
+    fs::create_dir_all(home.join(".gemini")).unwrap();
+    let file = home.join(".gemini/settings.json");
+    fs::write(&file, gemini_settings().to_string()).unwrap();
+    let mut said = String::new();
+    for _ in 0..2 {
+        said = String::from_utf8_lossy(&t.mux(&["install"]).stdout).into_owned();
+    }
+    assert!(said.contains("Gemini CLI runs hooks only in folders it trusts"));
+    let config = json_at(&file);
+    assert_eq!(config["theme"], "dark");
+    let found = ours(&config);
+    assert_eq!(
+        events(&found),
+        [
+            "AfterAgent",
+            "AfterTool",
+            "BeforeTool",
+            "SessionEnd",
+            "SessionStart"
+        ]
+    );
+    let matcher = |event: &str| found.iter().find(|(e, ..)| e == event).unwrap().1.clone();
+    assert_eq!(
+        matcher("BeforeTool").as_deref(),
+        Some("^(run_shell_command|write_file|replace)$")
+    );
+    assert_eq!(matcher("AfterTool").as_deref(), Some("^run_shell_command$"));
+    for event in ["AfterAgent", "SessionStart", "SessionEnd"] {
+        assert_eq!(matcher(event), None, "{event}");
+    }
+    for (event, _, h) in &found {
+        assert_eq!(h["type"], "command", "{event}");
+        assert_eq!(h["name"], "git-mux", "{event}");
+        assert_eq!(h["timeout"], 30000, "{event}");
+        assert!(h.get("statusMessage").is_none(), "{event}");
+        let command = h["command"].as_str().unwrap();
+        assert!(command.starts_with("[ -x '"), "{command}");
+        assert!(command.ends_with("git-mux' hook gemini"), "{command}");
+        assert!(command.contains("|| exit 0; exec '"), "{command}");
+    }
+    let before = config["hooks"]["BeforeTool"].as_array().unwrap();
+    assert_eq!(before.len(), 2);
+    assert_eq!(before[0]["hooks"][0]["command"], "/opt/other-guard");
+
+    t.mux(&["uninstall"]);
+    assert_eq!(json_at(&file), gemini_settings());
+}
+
+#[test]
+fn gemini_cli_home_replaces_the_home_directory() {
+    let t = T::new();
+    let home = t.tmp.join("home");
+    fs::create_dir_all(home.join(".gemini")).unwrap();
+    let home_file = home.join(".gemini/settings.json");
+    let theirs = gemini_settings().to_string();
+    fs::write(&home_file, &theirs).unwrap();
+    let gemini_home = t.tmp.join("gemini-home");
+    fs::create_dir_all(gemini_home.join(".gemini")).unwrap();
+    let env: [(&str, &Path); 1] = [("GEMINI_CLI_HOME", &gemini_home)];
+
+    assert!(t.run(&["install"], &env).status.success());
+    let wired = json_at(&gemini_home.join(".gemini/settings.json"));
+    assert_eq!(ours(&wired).len(), 5);
+    assert_eq!(fs::read_to_string(&home_file).unwrap(), theirs);
+
+    assert!(t.run(&["uninstall"], &env).status.success());
+    assert!(!gemini_home.join(".gemini/settings.json").exists());
+    assert_eq!(fs::read_to_string(&home_file).unwrap(), theirs);
+
+    let bare = t.tmp.join("bare-home");
+    fs::create_dir_all(&bare).unwrap();
+    let env: [(&str, &Path); 1] = [("GEMINI_CLI_HOME", &bare)];
+    assert!(t.run(&["install"], &env).status.success());
+    assert!(!bare.join(".gemini").exists());
+    assert_eq!(fs::read_to_string(&home_file).unwrap(), theirs);
+
+    let empty = Path::new("");
+    let env: [(&str, &Path); 1] = [("GEMINI_CLI_HOME", empty)];
+    assert!(t.run(&["install"], &env).status.success());
+    assert_eq!(ours(&json_at(&home_file)).len(), 5);
+}
+
+#[test]
+fn without_a_gemini_directory_nothing_is_written() {
+    let t = T::new();
+    let home = agent_dirs(&t);
+    let said = String::from_utf8_lossy(&t.mux(&["install"]).stdout).into_owned();
+    assert!(!home.join(".gemini").exists());
+    assert!(!said.contains("Gemini"), "{said}");
+}
+
+#[test]
+fn a_gemini_settings_file_that_is_not_json_is_refused_by_name() {
+    let t = T::new();
+    let home = t.tmp.join("home");
+    fs::create_dir_all(home.join(".gemini")).unwrap();
+    let file = home.join(".gemini/settings.json");
+    fs::write(&file, "{ // comment\n}").unwrap();
+    let o = t.run(&["install"], &[]);
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains(&*file.to_string_lossy()));
+    assert_eq!(fs::read_to_string(&file).unwrap(), "{ // comment\n}");
+}

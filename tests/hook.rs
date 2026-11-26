@@ -553,3 +553,28 @@ fn session_start_explains_the_checkout_only_inside_it() {
     assert_eq!(said(&wt), "");
     assert_eq!(said(Path::new("/")), "");
 }
+
+#[test]
+fn only_a_pre_tool_use_failure_refuses_and_the_other_events_report_and_go_on() {
+    let t = T::new();
+    let make = |event: &str| bash(&t, "A", event, "1", &t.repo, json!("make"));
+    assert!(passes(&make("PreToolUse")));
+    let lock = t.state().join("shell.lock");
+    let _ = fs::remove_file(&lock);
+    fs::create_dir(&lock).unwrap();
+
+    for event in ["PostToolUse", "PostToolUseFailure"] {
+        let o = make(event);
+        assert_eq!(o.status.code(), Some(0), "{event}");
+        assert!(o.stdout.is_empty(), "{event}");
+        let said = String::from_utf8_lossy(&o.stderr);
+        assert!(said.contains(&format!("{event} hook failed")), "{said}");
+    }
+    for event in ["Stop", "SessionEnd"] {
+        let o = fire(&t, "A", event, json!({}));
+        assert_eq!(o.status.code(), Some(0), "{event}");
+        assert!(!o.stderr.is_empty(), "{event}");
+    }
+    let reason = denied(&make("PreToolUse")).unwrap();
+    assert!(reason.contains("guard failed"), "{reason}");
+}

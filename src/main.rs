@@ -28,11 +28,11 @@ const USAGE: &str = "usage: git mux commit -m MSG [--take] [--] PATH...
        git mux sync      replay local commits onto the upstream; refuses when an incoming file is edited or staged here
        git mux push [REF...]  sync, run the pre-push hooks in a slot, push that exact commit (or each REF)
        git mux status    who holds which uncommitted file
-       git mux install [--project]  enroll and guard this checkout, wire the Claude Code / Codex hooks
+       git mux install [--project]  enroll and guard this checkout, wire the Claude Code, Codex and Gemini CLI hooks
                          (--project: also this checkout's own fail-closed Claude Code hooks)
        git mux uninstall take this checkout out of git-mux again
        git mux --version
-       git mux hook      (called by the agents around every tool call)";
+       git mux hook [gemini]  (called by the agents around every tool call)";
 
 fn message_and_paths(args: &[String]) -> Result<(String, Vec<String>, bool)> {
     let mut messages = Vec::new();
@@ -117,12 +117,19 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("hook") => {
-            // A crash must deny the tool call rather than let it through unguarded.
+            // A crash must deny a call that can be refused rather than let it through unguarded;
+            // any other event reports it and lets the agent go on.
             std::panic::set_hook(Box::new(|info| {
-                eprintln!("git-mux: the hook crashed, so the call is refused: {info}");
-                std::process::exit(2);
+                let code = hook::crash_code();
+                let outcome = if code == 2 {
+                    ", so the call is refused"
+                } else {
+                    ""
+                };
+                eprintln!("git-mux: the hook crashed{outcome}: {info}");
+                std::process::exit(code);
             }));
-            return hook::main();
+            return hook::main(args.get(1).map(String::as_str) == Some("gemini"));
         }
         Some("--version" | "-V") => {
             println!("git-mux {}", env!("CARGO_PKG_VERSION"));
