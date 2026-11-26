@@ -56,6 +56,27 @@ fn leases_keep_sessions_off_each_others_files() {
 }
 
 #[test]
+fn a_refused_edit_call_claims_nothing() {
+    let t = T::new();
+    let a = t.repo.join("a.txt").to_string_lossy().into_owned();
+    assert_eq!(t.hook("A", "Edit", json!({"file_path": a})), None);
+    t.write("a.txt", "A is editing\n");
+    let patch = "*** Begin Patch\n*** Add File: free.txt\n+x\n*** Update File: a.txt\n@@\n-a\n+b\n*** End Patch\n";
+    assert!(
+        t.hook("B", "apply_patch", json!({"command": patch}))
+            .unwrap()
+            .contains("another live agent")
+    );
+    t.write("free.txt", "written by someone else\n");
+    let held = t.leases();
+    assert!(held.get("free.txt").is_none(), "{held}");
+    assert_eq!(held["a.txt"]["session"], "A");
+    let free = t.repo.join("free.txt").to_string_lossy().into_owned();
+    assert_eq!(t.hook("C", "Edit", json!({"file_path": free})), None);
+    assert_eq!(t.leases()["free.txt"]["session"], "C");
+}
+
+#[test]
 fn a_gone_session_frees_its_files() {
     let t = T::new();
     let a = t.repo.join("a.txt").to_string_lossy().into_owned();

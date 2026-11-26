@@ -483,6 +483,10 @@ fn events_close_the_pending_calls_they_can_know_are_over() {
     assert!(passes(&fire(&t, "A", "Interrupt", json!({}))));
     assert_eq!(keys(&t), ["sub2"]);
 
+    call("failed", None);
+    assert!(passes(&fire(&t, "A", "StopFailure", json!({}))));
+    assert_eq!(keys(&t), ["sub2"]);
+
     call("other", None);
     assert!(passes(&fire(&t, "B", "Stop", json!({}))));
     assert_eq!(keys(&t), ["other", "sub2"]);
@@ -570,7 +574,7 @@ fn only_a_pre_tool_use_failure_refuses_and_the_other_events_report_and_go_on() {
         let said = String::from_utf8_lossy(&o.stderr);
         assert!(said.contains(&format!("{event} hook failed")), "{said}");
     }
-    for event in ["Stop", "SessionEnd"] {
+    for event in ["Stop", "StopFailure", "SessionEnd"] {
         let o = fire(&t, "A", event, json!({}));
         assert_eq!(o.status.code(), Some(0), "{event}");
         assert!(!o.stderr.is_empty(), "{event}");

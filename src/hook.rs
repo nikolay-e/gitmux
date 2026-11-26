@@ -120,6 +120,7 @@ fn reports_only(event: &str) -> bool {
             | "AfterTool"
             | "PermissionDenied"
             | "Stop"
+            | "StopFailure"
             | "AfterAgent"
             | "Interrupt"
             | "SubagentStop"
@@ -251,7 +252,7 @@ fn handle(p: &Value, event: &str, roots: &[Root]) -> Result<Decision> {
             drop_calls(roots, session, |id, _| id == key)?;
             Ok(Decision::Allow)
         }
-        "Stop" | "Interrupt" => {
+        "Stop" | "StopFailure" | "Interrupt" => {
             drop_calls(roots, session, |_, call| call.get("agent_id").is_none())?;
             Ok(Decision::Allow)
         }
@@ -363,17 +364,25 @@ fn pre(p: &Value, roots: &[Root], cwd: &Path, session: &str) -> Result<Decision>
             None => by_root.push((root, vec![rel])),
         }
     }
+    let refused = |owners: String| {
+        Decision::Deny(format!(
+            "{owners} has uncommitted edits by another live agent. Coordinate with it, wait for its commit, or work on another file."
+        ))
+    };
+    for (root, paths) in &by_root {
+        let owners = root.repo()?.foreign_leases(&owner, paths)?;
+        if !owners.is_empty() {
+            return Ok(refused(owners));
+        }
+    }
     for (root, paths) in by_root {
-        let foreign = root.repo()?.claim(&owner, &paths)?;
+        let foreign = root.repo()?.claim(&owner, &paths, true)?;
         if !foreign.is_empty() {
             let owners: Vec<String> = foreign
                 .iter()
                 .map(|(p, s)| format!("{p} (session {})", short(s)))
                 .collect();
-            return Ok(Decision::Deny(format!(
-                "{} has uncommitted edits by another live agent. Coordinate with it, wait for its commit, or work on another file.",
-                owners.join(", ")
-            )));
+            return Ok(refused(owners.join(", ")));
         }
     }
     Ok(Decision::Allow)
@@ -629,7 +638,7 @@ fn shell_snapshot(repo: &Repo, p: &Value, session: &str, post: bool) -> Result<O
         .cloned()
         .collect();
     if !loose.is_empty() && busy.is_empty() {
-        repo.claim(&Owner::from_payload(p), &loose)?;
+        repo.claim(&Owner::from_payload(p), &loose, false)?;
     }
     let noted: Vec<String> = noted
         .into_iter()

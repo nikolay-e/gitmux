@@ -54,7 +54,7 @@ each other's work.
   process counts as alive, because treating it as gone would hand an unidentified agent's files to
   other sessions; `SessionEnd` releases it.
 - Nothing expires on a clock. A pending shell call closes on an event only — `PostToolUse`,
-  `PostToolUseFailure`, `PermissionDenied`, `Stop`, `Interrupt`, `SubagentStop`, `SessionEnd` or
+  `PostToolUseFailure`, `PermissionDenied`, `Stop`, `StopFailure`, `Interrupt`, `SubagentStop`, `SessionEnd` or
   a gone agent process. A call that was cancelled or refused by a dialog degrades attribution to
   "unowned" until the session's next `Stop`, never to a wrong owner. A shell command's writes
   become its session's only when no other session was active in the same window.

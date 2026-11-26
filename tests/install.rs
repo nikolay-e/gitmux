@@ -81,9 +81,20 @@ fn install_wires_each_agent_once_and_keeps_other_hooks() {
             "SessionEnd",
             "SessionStart",
             "Stop",
+            "StopFailure",
             "SubagentStop"
         ]
     );
+    let mut earlier = claude.clone();
+    earlier["hooks"]
+        .as_object_mut()
+        .unwrap()
+        .remove("StopFailure");
+    fs::write(home.join(".claude/settings.json"), earlier.to_string()).unwrap();
+    for _ in 0..2 {
+        t.mux(&["install"]);
+    }
+    assert_eq!(json_at(&home.join(".claude/settings.json")), claude);
     let matcher = |event: &str| found.iter().find(|(e, ..)| e == event).unwrap().1.clone();
     assert_eq!(
         matcher("PreToolUse").as_deref(),
@@ -92,7 +103,13 @@ fn install_wires_each_agent_once_and_keeps_other_hooks() {
     for event in ["PostToolUse", "PostToolUseFailure", "PermissionDenied"] {
         assert_eq!(matcher(event).as_deref(), Some("Bash"), "{event}");
     }
-    for event in ["Stop", "SubagentStop", "SessionStart", "SessionEnd"] {
+    for event in [
+        "Stop",
+        "StopFailure",
+        "SubagentStop",
+        "SessionStart",
+        "SessionEnd",
+    ] {
         assert_eq!(matcher(event), None, "{event}");
     }
     for (event, _, h) in &found {

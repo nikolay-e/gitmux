@@ -118,8 +118,14 @@ impl Repo {
     }
 
     /// Claims every unowned or orphaned path for the owner, marks when it last touched each, and
-    /// returns those another live owner holds with their holder.
-    pub fn claim(&self, owner: &Owner, paths: &[String]) -> Result<BTreeMap<String, String>> {
+    /// returns those another live owner holds with their holder. With `all_or_nothing` a call that
+    /// meets a holder saves nothing, so a refused call leaves no lease behind.
+    pub fn claim(
+        &self,
+        owner: &Owner,
+        paths: &[String],
+        all_or_nothing: bool,
+    ) -> Result<BTreeMap<String, String>> {
         let agents = &self.cfg.agents;
         let _lock = self.lock("leases")?;
         let mut held = self.leases()?;
@@ -130,7 +136,7 @@ impl Repo {
             }
         }
         let mine: Vec<&String> = paths.iter().filter(|p| !foreign.contains_key(*p)).collect();
-        if mine.is_empty() {
+        if mine.is_empty() || (all_or_nothing && !foreign.is_empty()) {
             return Ok(foreign);
         }
         let now = now();

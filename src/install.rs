@@ -211,6 +211,7 @@ fn agents() -> Vec<Agent> {
             ("PostToolUseFailure", Some("Bash")),
             ("PermissionDenied", Some("Bash")),
             ("Stop", None),
+            ("StopFailure", None),
             ("SubagentStop", None),
             ("SessionStart", None),
             ("SessionEnd", None),
