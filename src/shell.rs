@@ -886,24 +886,115 @@ fn start(cwd: &Path) -> State {
     }
 }
 
-fn subcommand(args: &[String]) -> Option<(usize, &str)> {
+/// The global options before the subcommand with their values, and where the subcommand is.
+fn globals(args: &[String]) -> (Vec<(&str, &str)>, usize) {
+    let mut opts = Vec::new();
     let mut i = 0;
-    while i < args.len() && args[i].starts_with('-') {
-        i += if matches!(args[i].as_str(), "-C" | "-c" | "--git-dir" | "--work-tree") {
-            2
+    while let Some(a) = args
+        .get(i)
+        .map(String::as_str)
+        .filter(|a| a.starts_with('-'))
+    {
+        let attached = a.split_once('=').filter(|(name, _)| name.starts_with("--"));
+        let takes_value = matches!(
+            a,
+            "-C" | "-c"
+                | "--git-dir"
+                | "--work-tree"
+                | "--namespace"
+                | "--super-prefix"
+                | "--config-env"
+                | "--attr-source"
+        );
+        i += 1;
+        if let Some(pair) = attached {
+            opts.push(pair);
+        } else if takes_value {
+            opts.push((a, args.get(i).map_or("", String::as_str)));
+            i += 1;
         } else {
-            1
-        };
+            opts.push((a, ""));
+        }
     }
-    args.get(i).map(|s| (i, s.as_str()))
+    (opts, i)
 }
 
-/// Commit, stash and push are refused by git itself (see install); these rewrite files or the
-/// index before any ref moves, so only the tool hook can stop them in time.
-pub fn guard_git(args: &[String]) -> Option<&'static str> {
-    let (i, sub) = subcommand(args)?;
+fn writes_hooks_path(rest: &[String]) -> bool {
+    let Some(key) = rest
+        .iter()
+        .position(|a| a.eq_ignore_ascii_case("core.hooksPath"))
+    else {
+        return false;
+    };
+    let any = |words: &[&str]| rest.iter().any(|a| words.contains(&a.as_str()));
+    let reads = any(&[
+        "--get",
+        "--get-all",
+        "--get-regexp",
+        "--list",
+        "-l",
+        "get",
+        "list",
+    ]);
+    let writes = any(&[
+        "--unset",
+        "--unset-all",
+        "--add",
+        "--replace-all",
+        "--edit",
+        "-e",
+        "set",
+        "unset",
+    ]);
+    writes || (!reads && rest[key + 1..].iter().any(|a| !a.starts_with('-')))
+}
+
+/// `git rm` naming everything under a path: `.`, `:/`, a glob, or a directory that exists.
+fn rm_is_broad(rest: &[String], dir: Option<&Path>) -> bool {
+    let mut pathspecs = false;
+    rest.iter().any(|a| {
+        if !pathspecs && a == "--" {
+            pathspecs = true;
+            return false;
+        }
+        if !pathspecs && a.starts_with('-') {
+            return false;
+        }
+        let exists = |p: &Path| dir.map_or_else(|| p.is_dir(), |d| d.join(p).is_dir());
+        matches!(a.as_str(), "." | ":/" | ":")
+            || a.contains(['*', '?', '['])
+            || exists(Path::new(a))
+    })
+}
+
+/// Commit, stash and push are refused by git itself (see install), but only after the tool hook
+/// has let them start; these rewrite files, the index or the branch before git could object, so
+/// only the tool hook can stop them in time. `dir` is where the command runs, when known: a
+/// directory named to `git rm` is looked up there, else in this process's own directory.
+pub fn guard_in(args: &[String], dir: Option<&Path>) -> Option<&'static str> {
+    let (opts, i) = globals(args);
+    for (name, value) in opts {
+        if matches!(name, "-c" | "--config-env") {
+            let key = value.split('=').next().unwrap_or("").to_ascii_lowercase();
+            if key.starts_with("alias.") {
+                return Some(
+                    "an inline alias hides which git command runs; name the command itself",
+                );
+            }
+            if key == "core.hookspath" {
+                return Some(
+                    "a different hooksPath would run hooks in the shared tree or skip them",
+                );
+            }
+        }
+    }
+    let sub = args.get(i)?.as_str();
     let rest = &args[i + 1..];
     let has = |w: &str| rest.iter().any(|a| a == w);
+    let short = |c: char| {
+        rest.iter()
+            .any(|a| a.starts_with('-') && !a.starts_with("--") && a[1..].contains(c))
+    };
     let broad = rest.iter().any(|a| {
         matches!(
             a.as_str(),
@@ -911,7 +1002,41 @@ pub fn guard_git(args: &[String]) -> Option<&'static str> {
         )
     });
     match sub {
-        "stash" if matches!(rest.first().map(String::as_str), Some("list" | "show")) => None,
+        "stash"
+            if !matches!(
+                rest.first().map(String::as_str),
+                Some("list" | "show" | "create")
+            ) =>
+        {
+            Some(
+                "stash takes every session's uncommitted edits out of the tree; commit your own paths with git mux, or work in a worktree",
+            )
+        }
+        "commit" => Some(
+            "commit only through `git mux commit -m MSG -- PATH…`, which takes your paths alone and runs the hooks in a slot",
+        ),
+        "push" => Some(
+            "push through `git mux push`: it verifies the push in a slot, and --no-verify would skip that",
+        ),
+        "bisect" => Some("bisect moves HEAD and rewrites the tree; run it in a worktree"),
+        "filter-branch" => {
+            Some("filter-branch rewrites history and the tree; run it in a clone or worktree")
+        }
+        "sparse-checkout" if rest.first().map(String::as_str) != Some("list") => {
+            Some("sparse-checkout rewrites the shared tree for every session; use a worktree")
+        }
+        "read-tree" if has("--reset") || short('u') || short('m') => {
+            Some("read-tree with -u, -m or --reset overwrites the shared index or tree")
+        }
+        "checkout-index" if has("--all") || has("--force") || short('a') || short('f') => {
+            Some("checkout-index -a or -f overwrites files others are editing; name single files")
+        }
+        "rm" if rm_is_broad(rest, dir) => {
+            Some("rm here names its own files; a directory, glob or `.` removes others' work too")
+        }
+        "config" if writes_hooks_path(rest) => {
+            Some("core.hooksPath decides which hooks run; do not change it in the shared checkout")
+        }
         "clean" => Some("untracked files here may be another session's"),
         "pull" => Some("use `git mux sync`: it never touches files someone is editing"),
         "rebase" => Some("rebase rewrites the shared tree; use `git mux sync`, or a worktree"),
@@ -931,6 +1056,11 @@ pub fn guard_git(args: &[String]) -> Option<&'static str> {
         ),
         _ => None,
     }
+}
+
+/// `guard_in` for a command whose directory is not known.
+pub fn guard_git(args: &[String]) -> Option<&'static str> {
+    guard_in(args, None)
 }
 
 /// The paths a `git mux commit …` names.
