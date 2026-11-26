@@ -1,0 +1,73 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-26-intel }
+          - { target: aarch64-apple-darwin, os: macos-26 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The tag names the crate's version
+        run: |
+          version="$(cargo pkgid | sed 's/.*[#@]//')"
+          [ "v${version}" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} but Cargo.toml says ${version}" >&2; exit 1; }
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --target "${{ matrix.target }}" --no-self-update
+          rustup default stable
+          rustc --version
+      - run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Archive
+        run: |
+          name="git-mux-${{ matrix.target }}"
+          mkdir "${name}"
+          cp "target/${{ matrix.target }}/release/git-mux" LICENSE README.md "${name}/"
+          tar -czf "${name}.tar.gz" "${name}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: git-mux-${{ matrix.target }}
+          path: git-mux-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          pattern: git-mux-*
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum git-mux-*.tar.gz | tee SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/git-mux-*.tar.gz
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/git-mux-*.tar.gz dist/SHA256SUMS --repo "${GITHUB_REPOSITORY}" --title "${GITHUB_REF_NAME}" --generate-notes --verify-tag
