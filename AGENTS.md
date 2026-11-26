@@ -19,12 +19,32 @@ each other's work.
   manager. git-mux never names a linter or a framework.
 - Slots are persistent and `git worktree lock`ed: they hold built dependencies, and cleanup must
   not delete them.
-- The agent hook fails closed: a crash, an unreadable payload or a git error exits 2, which both
-  Claude Code and Codex honour as a refusal. A call that concerns no enrolled checkout exits 0
-  before parsing anything.
-- A lease belongs to the agent process (pid plus start time), not to the session id, so a gone
-  agent frees its files. A shell command's writes become its session's only when no other
-  session was active in the same window; otherwise they stay unowned.
+- No hook ever runs in the live tree of the shared checkout, and there is no exception: a guard
+  line in front of the pre-commit, commit-msg and pre-push files refuses a plain commit or push
+  before they run, and `GIT_MUX=1` skips only the reference-transaction guard (a deliberate ref
+  move). The one deliberate bypass is `GIT_MUX=1 git commit --no-verify`. post-commit is not run
+  at all, and prepare-commit-msg stays unguarded because that bypass runs it.
+- The agent hook parses every payload and fails closed: a crash, a git error or an unreadable
+  payload that names an enrolled checkout exits 2, which both Claude Code and Codex honour as a
+  refusal. A call that concerns no enrolled checkout exits 0, and lifecycle events never refuse
+  (exit 2 on `Stop` would force the agent on). Two handlers run per call: the user-level one is
+  a shell wrapper that exits 0 when the binary is missing, so other projects are never blocked;
+  the project one (`.claude/settings.local.json`, exec form, `onFailure: "block"`) refuses where
+  the checkout is enrolled. Claude Code runs an identical handler from two files once, which is
+  why the commands differ, so every handler is idempotent per `tool_use_id`. Codex gets no
+  project file and is treated as fail-open until its failure semantics are documented.
+- A lease belongs to a session, a subagent's `agent_id` and the agent process (pid plus start
+  time), never to the session id alone: two subagents of one session clash, and a gone agent
+  frees its files. A caller with no session is judged by agent process only. A lease or shell
+  log with no recorded process counts as alive, because treating it as gone would hand an
+  unidentified agent's files to other sessions; `SessionEnd` releases it.
+- Nothing expires on a clock. A pending shell call closes on an event only — `PostToolUse`,
+  `PostToolUseFailure`, `PermissionDenied`, `Stop`, `Interrupt`, `SubagentStop`, `SessionEnd` or
+  a gone agent process. A call that was cancelled or refused by a dialog degrades attribution to
+  "unowned" until the session's next `Stop`, never to a wrong owner. A shell command's writes
+  become its session's only when no other session was active in the same window.
+- Only `git mux install` enrolls a checkout; every other command repairs the guards of one that
+  is enrolled and touches nothing else. `uninstall` gives every hook file back byte for byte.
 - Publishing writes a journal first; every run heals an interrupted one before doing anything.
 
 ## Traps
@@ -35,8 +55,23 @@ each other's work.
   are left to the agent hook; the git hook guards the branch ref and `refs/stash`.
 - Empty path lists mean "nothing", never "the whole tree": `git ls-files` and `checkout` with no
   pathspec act on everything.
-- Tests drive the real binary against real repositories, hooks and processes
-  (`tests/shared_checkout.rs`); they set `HOME` and `XDG_CONFIG_HOME` per test so nothing reaches
-  the developer's agent config.
+- A hooks directory git tracks is never edited: a note names the line to add instead. An ignored
+  and generated one (husky) is rewritten on every run, so git-mux adds its line again on each
+  `git mux` call; the slot copies it from the checkout, and a hook the checkout has but the slot
+  lacks refuses.
+- A configured hook (`hook.<name>.event`, git 2.54+) runs before the hook file and cannot be
+  stopped by it; only the agent hook covers agents there. The shell parser is hand-written
+  (`serde_json` is the only dependency): any word `git` or `…/git` starts a git invocation
+  wherever it stands, and inline interpreter code and script files are not parsed — the git layer
+  still refuses branch moves, stash and live-tree hooks.
+- Every git call runs with `GIT_LITERAL_PATHSPECS=1` so `[id]` paths stay literal; what runs user
+  code (hooks, `slotSetup`) or needs a glob has it removed. `slotSetup` is shell run for anyone
+  who commits in the checkout, the same trust as its hooks; `selfInstall` replaces the binary, so
+  only local git config may set it, never the committed `.gitmux`.
+- Tests drive the real binary against real repositories, hooks and processes (`tests/*.rs` on
+  the harness in `tests/common`); each test sets `HOME`, `XDG_CONFIG_HOME` and `XDG_CACHE_HOME`
+  so nothing reaches the developer's agent config or slot cache, and no lease test may depend on
+  an ambient `claude` or `codex` ancestor process. `GITMUX_TEST_PRE_COMMIT=1` makes a missing
+  `pre-commit` a failure instead of a skip.
 - This crate lives in a monorepo and is published by `git subtree split --prefix=gitmux`: it must
   not name the monorepo, its hosts or its people.
