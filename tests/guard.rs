@@ -213,6 +213,50 @@ fn a_tracked_hooks_dir_is_untouched_and_install_prints_the_line() {
 }
 
 #[test]
+fn a_commit_msg_hook_without_a_pre_commit_file_is_guarded_too() {
+    let t = T::new();
+    let probe = t.tmp.join("commit-msg-probe");
+    let hooks = t.repo.join(".git/hooks");
+    fs::remove_file(hooks.join("pre-commit")).unwrap();
+    fs::write(
+        hooks.join("commit-msg"),
+        "#!/bin/sh\necho ran > \"$MUX_PROBE\"\n",
+    )
+    .unwrap();
+    t.mux(&["install"]);
+    assert!(
+        fs::read_to_string(hooks.join("commit-msg"))
+            .unwrap()
+            .contains("\"$g\" commit || exit 1  # git-mux")
+    );
+
+    let head = t.rev(&t.repo, "HEAD");
+    t.write("a.txt", "a2\n");
+    let refused = git_env(
+        &t,
+        &t.repo,
+        &[("MUX_PROBE", &probe)],
+        &["commit", "-qam", "area: x"],
+    );
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("plain git commit in the shared checkout"));
+    assert!(
+        !probe.exists(),
+        "the repository's commit-msg ran in the live tree"
+    );
+    assert_eq!(t.rev(&t.repo, "HEAD"), head);
+
+    let deliberate = git_env(
+        &t,
+        &t.repo,
+        &[("MUX_PROBE", &probe), ("GIT_MUX", Path::new("1"))],
+        &["commit", "-qam", "area: x", "--no-verify"],
+    );
+    assert!(deliberate.status.success(), "{}", stderr(&deliberate));
+    assert!(!probe.exists());
+}
+
+#[test]
 fn a_perl_pre_commit_hook_is_chained() {
     let t = T::new();
     let probe = t.tmp.join("perl-probe");

@@ -8,7 +8,11 @@ const HEADER: &str = "#!/bin/sh\n# Installed by git-mux (https://github.com/niko
 const MARK: &str = "# git-mux";
 const CHAINED: &str = "gitmux-chained";
 const REF_HOOK: &str = "reference-transaction";
-const GUARDED: [(&str, &str); 2] = [("pre-commit", "commit"), ("pre-push", "push")];
+const GUARDED: [(&str, &str); 3] = [
+    ("pre-commit", "commit"),
+    ("commit-msg", "commit"),
+    ("pre-push", "push"),
+];
 const CONFIGURED: [&str; 4] = ["pre-commit", "prepare-commit-msg", "commit-msg", "pre-push"];
 
 /// Written to `<common>/gitmux/guard`, outside the hooks dir; each hook calls it with its verb.
@@ -306,7 +310,7 @@ pub fn remove(repo: &Repo) -> Result<()> {
     let hooks = hooks_dir(repo)?;
     if !tracked(repo, &hooks) {
         let _ = fs::remove_file(hooks.join("mux-guard"));
-        for name in [GUARDED[0].0, GUARDED[1].0, REF_HOOK] {
+        for name in GUARDED.map(|(name, _)| name).into_iter().chain([REF_HOOK]) {
             let hook = hooks.join(name);
             let Some(text) = fs::read_to_string(&hook).ok().filter(|_| !is_link(&hook)) else {
                 continue;
