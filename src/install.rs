@@ -23,8 +23,9 @@ pub fn registered_roots() -> Vec<PathBuf> {
         .collect()
 }
 
-pub fn ensure(repo: &Repo) -> Result<()> {
-    guard::ensure(repo)?;
+/// Guards and enrolls the checkout; returns the notes about what the guards cannot cover.
+pub fn ensure(repo: &Repo) -> Result<Vec<String>> {
+    let notes = guard::ensure(repo)?;
     let _ = fs::remove_dir_all(repo.state.join("bin"));
     let root = repo.main_root();
     let mut roots = registered_roots();
@@ -35,7 +36,7 @@ pub fn ensure(repo: &Repo) -> Result<()> {
         let text: String = roots.iter().map(|r| format!("{}\n", r.display())).collect();
         write_atomic(&file, text.as_bytes(), None)?;
     }
-    Ok(())
+    Ok(notes)
 }
 
 fn is_ours(hook: &Value) -> bool {
@@ -82,9 +83,9 @@ fn wire(file: &Path, command: &str, pre: &str, post: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// `git mux install`: the git guards, plus the tool hooks of every agent installed for this user.
+/// `git mux install`: the tool hooks of every agent installed for this user, on top of the git
+/// guards every run places.
 pub fn install(repo: &Repo) -> Result<()> {
-    ensure(repo)?;
     let exe = std::env::current_exe()?;
     let command = format!(
         "'{}' hook",

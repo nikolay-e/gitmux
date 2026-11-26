@@ -72,7 +72,12 @@ fn run(args: &[String]) -> Result<()> {
         return Err(Refused(USAGE.into()));
     }
     let repo = repo::Repo::open(&std::env::current_dir()?)?;
-    install::ensure(&repo)?;
+    let notes = install::ensure(&repo)?;
+    if matches!(cmd, "install" | "status") {
+        for note in notes {
+            eprintln!("{note}");
+        }
+    }
     journal::heal(&repo)?;
     match cmd {
         "commit" => {
