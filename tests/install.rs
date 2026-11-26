@@ -633,6 +633,7 @@ fn install_refuses_a_hooks_value_that_is_not_an_object_before_it_changes_anythin
     let gemini = home.join(".gemini/settings.json");
     fs::write(&gemini, r#"{"hooks": []}"#).unwrap();
     let claude = home.join(".claude/settings.json");
+    fs::create_dir_all(claude.parent().unwrap()).unwrap();
     fs::write(&claude, r#"{"model": "x"}"#).unwrap();
     refused_install(&t, &second, &gemini, "hooks");
     assert_eq!(fs::read_to_string(&gemini).unwrap(), r#"{"hooks": []}"#);
@@ -646,8 +647,10 @@ fn install_refuses_an_event_that_is_not_a_list_before_it_changes_anything() {
     let second = second_checkout(&t);
     let claude = home.join(".claude/settings.json");
     let theirs = r#"{"hooks": {"PreToolUse": "x"}}"#;
+    fs::create_dir_all(claude.parent().unwrap()).unwrap();
     fs::write(&claude, theirs).unwrap();
     let codex = home.join(".codex/hooks.json");
+    fs::create_dir_all(codex.parent().unwrap()).unwrap();
     fs::write(&codex, "{}").unwrap();
     refused_install(&t, &second, &claude, "PreToolUse");
     assert_eq!(fs::read_to_string(&claude).unwrap(), theirs);
@@ -662,6 +665,7 @@ fn uninstall_validates_every_settings_file_before_it_removes_anything() {
     t.mux(&["commit", "-m", "t: a", "a.txt"]);
     let slot = t.tmp.join("slots/mux-verify-0");
     assert!(slot.exists());
+    fs::create_dir_all(claude.parent().unwrap()).unwrap();
     fs::write(&claude, "{ // comment\n}").unwrap();
     let o = t.run(&["uninstall"], &[]);
     let err = String::from_utf8_lossy(&o.stderr);
