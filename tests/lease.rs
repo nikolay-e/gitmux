@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The binary run as `session`, whatever agent process this suite happens to run under.
 fn as_session(t: &T, session: &str, args: &[&str]) -> Output {
@@ -260,13 +261,22 @@ fn a_caller_without_a_session_is_judged_by_agent_process_alone() {
     assert_eq!(t.head_file("a.txt"), "A is editing\n");
 }
 
-/// A `node` that is /bin/sh and a script named like an agent: the shape of `node …/bin/gemini`,
-/// with the node process as the one that stays alive.
+/// A `node` that is a shell and a script named like an agent: the shape of `node …/bin/gemini`,
+/// with the node process as the one that stays alive. Every call gets its own directory, so a
+/// second fake never rewrites a script a running one is still reading.
 fn fake_node(t: &T, script: &str, body: &str) -> Command {
-    let dir = t.tmp.join("fake").join(script);
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let dir = t
+        .tmp
+        .join("fake")
+        .join(CALLS.fetch_add(1, Ordering::Relaxed).to_string());
     fs::create_dir_all(&dir).unwrap();
     let node = dir.join("node");
-    let _ = std::os::unix::fs::symlink("/bin/sh", &node);
+    let shell = ["/bin/bash", "/bin/sh"]
+        .into_iter()
+        .find(|s| Path::new(s).exists())
+        .unwrap();
+    std::os::unix::fs::symlink(shell, &node).unwrap();
     let file = dir.join(script);
     fs::write(&file, format!("#!/bin/sh\n{body}")).unwrap();
     let mut c = cmd(&node.to_string_lossy(), &t.tmp);
