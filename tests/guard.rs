@@ -1,7 +1,9 @@
 mod common;
 
 use common::*;
+use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Output;
 
@@ -144,7 +146,9 @@ fn hook_lines_are_current_idempotent_and_replace_older_ones() {
     let push = fs::read_to_string(hooks.join("pre-push")).unwrap();
     assert!(push.contains("\"$g\" push || exit 1  # git-mux"));
     let guard = fs::read_to_string(t.state().join("guard")).unwrap();
-    assert!(!guard.contains("GIT_MUX"));
+    // Only a guard line marked `open` (prepare-commit-msg's) lets the override through.
+    assert_eq!(guard.matches("GIT_MUX").count(), 1);
+    assert!(guard.contains("[ \"$2\" = open ] && [ -n \"$GIT_MUX\" ] && exit 0"));
 
     t.mux(&["install"]);
     assert_eq!(
@@ -390,5 +394,206 @@ fn a_sha256_repository_commits_deletes_branches_and_refuses_resets() {
     t.sh(&repo, &["git", "branch", "topic"]);
     assert!(t.git_ok(&repo, &["branch", "-D", "topic"]));
     assert!(!t.git_ok(&repo, &["reset", "--soft", "HEAD~"]));
+    assert!(!t.git_ok(&repo, &["update-ref", "-d", "refs/heads/main"]));
+    assert!(!t.git_ok(&repo, &["update-ref", "-d", "refs/heads/main", &head]));
+    assert!(t.git_ok(&repo, &["pack-refs", "--all"]));
+    assert!(t.git_ok(&repo, &["gc", "-q"]));
     assert_eq!(t.rev(&repo, "HEAD"), head);
+}
+
+#[test]
+fn the_shared_branch_cannot_be_deleted_but_ref_maintenance_works() {
+    let t = T::new();
+    let head = t.rev(&t.repo, "HEAD");
+    let wt = t.tmp.join("wt");
+    t.sh(
+        &t.repo,
+        &[
+            "git",
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat",
+            &wt.to_string_lossy(),
+        ],
+    );
+    for dir in [&t.repo, &wt] {
+        assert!(!t.git_ok(dir, &["update-ref", "-d", "refs/heads/main"]));
+        assert!(!t.git_ok(dir, &["update-ref", "-d", "refs/heads/main", &head]));
+    }
+    assert_eq!(t.rev(&t.repo, "main"), head);
+
+    // pack-refs and gc delete the loose file of a branch that is packed at the same value,
+    // whether or not the branch moved since the last pack.
+    assert!(t.git_ok(&t.repo, &["pack-refs", "--all"]));
+    for round in 0..2 {
+        t.write("a.txt", &format!("round {round}\n"));
+        t.mux(&["commit", "-m", "area: moved", "--", "a.txt"]);
+        let moved = t.rev(&t.repo, "main");
+        assert!(
+            t.git_ok(&t.repo, &["pack-refs", "--all"]),
+            "pack-refs {round}"
+        );
+        assert_eq!(t.rev(&t.repo, "main"), moved);
+        t.write("a.txt", &format!("again {round}\n"));
+        t.mux(&["commit", "-m", "area: moved again", "--", "a.txt"]);
+        let moved = t.rev(&t.repo, "main");
+        assert!(t.git_ok(&t.repo, &["gc", "-q"]), "gc {round}");
+        assert_eq!(t.rev(&t.repo, "main"), moved);
+    }
+
+    t.sh(&t.repo, &["git", "branch", "loose"]);
+    t.sh(&t.repo, &["git", "branch", "packed"]);
+    t.sh(&t.repo, &["git", "pack-refs", "--all"]);
+    t.sh(&t.repo, &["git", "branch", "other"]);
+    for name in ["loose", "packed", "other"] {
+        assert!(t.git_ok(
+            &t.repo,
+            &["update-ref", "-d", &format!("refs/heads/{name}")]
+        ));
+    }
+
+    let deliberate = git_env(
+        &t,
+        &t.repo,
+        &[("GIT_MUX", Path::new("1"))],
+        &["update-ref", "-d", "refs/heads/main"],
+    );
+    assert!(deliberate.status.success(), "{}", stderr(&deliberate));
+    assert!(!t.git_ok(&t.repo, &["rev-parse", "-q", "--verify", "refs/heads/main"]));
+}
+
+fn snapshot(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap())
+        .filter(|e| e.path().is_file())
+        .map(|e| {
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                fs::read(e.path()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn logging_hook(t: &T, path: &Path, body: &str) {
+    fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    executable(t, path);
+}
+
+#[test]
+fn no_hook_file_runs_in_the_live_tree_whatever_files_exist() {
+    let t = T::new();
+    t.mux(&["uninstall"]);
+    let hooks = t.repo.join(".git/hooks");
+    for name in ["pre-commit", "commit-msg", "pre-push"] {
+        fs::remove_file(hooks.join(name)).unwrap();
+    }
+    let record = "git rev-parse --show-toplevel >> \"$MUX_PROBE\"";
+    logging_hook(&t, &hooks.join("prepare-commit-msg"), record);
+    logging_hook(&t, &hooks.join("commit-msg"), record);
+    let before = snapshot(&hooks);
+
+    t.mux(&["install"]);
+    let created = fs::read_to_string(hooks.join("pre-commit")).unwrap();
+    assert!(created.starts_with("#!/bin/sh\n"));
+    assert!(created.contains("\"$g\" commit || exit 1  # git-mux"));
+    assert_eq!(
+        fs::metadata(hooks.join("pre-commit"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    let prepare = fs::read_to_string(hooks.join("prepare-commit-msg")).unwrap();
+    assert!(prepare.contains("\"$g\" commit open || exit 1  # git-mux"));
+    t.mux(&["install"]);
+    assert_eq!(
+        fs::read_to_string(hooks.join("pre-commit")).unwrap(),
+        created
+    );
+
+    let probe = t.tmp.join("live-probe");
+    let head = t.rev(&t.repo, "HEAD");
+    t.write("a.txt", "a2\n");
+    let env = [("MUX_PROBE", probe.as_path())];
+    let mux = [("MUX_PROBE", probe.as_path()), ("GIT_MUX", Path::new("1"))];
+    let attempts: [(bool, &[&str]); 3] = [
+        (false, &["commit", "-qam", "area: x"]),
+        (false, &["commit", "-qam", "area: x", "--no-verify"]),
+        (true, &["commit", "-qam", "area: x"]),
+    ];
+    for (override_set, args) in attempts {
+        let vars = if override_set { &mux[..] } else { &env[..] };
+        let refused = git_env(&t, &t.repo, vars, args);
+        assert!(!refused.status.success(), "{args:?} landed");
+        assert!(
+            stderr(&refused).contains("plain git commit in the shared checkout"),
+            "{args:?}: {}",
+            stderr(&refused)
+        );
+        assert!(!probe.exists(), "{args:?} ran a hook in the live tree");
+        assert_eq!(t.rev(&t.repo, "HEAD"), head);
+    }
+
+    let deliberate = git_env(
+        &t,
+        &t.repo,
+        &mux,
+        &["commit", "-qam", "area: x", "--no-verify"],
+    );
+    assert!(deliberate.status.success(), "{}", stderr(&deliberate));
+    assert_ne!(t.rev(&t.repo, "HEAD"), head);
+    assert_eq!(
+        fs::read_to_string(&probe).unwrap().trim(),
+        t.repo.to_string_lossy()
+    );
+
+    let slot_probe = t.tmp.join("slot-probe");
+    t.write("b.txt", "b2\n");
+    let o = t.run(
+        &["commit", "-m", "area: b2", "--", "b.txt"],
+        &[("MUX_PROBE", slot_probe.as_path())],
+    );
+    assert!(o.status.success(), "{}", stderr(&o));
+    let ran = fs::read_to_string(&slot_probe).unwrap();
+    assert_eq!(ran.lines().count(), 2, "{ran}");
+    assert!(ran.lines().all(|l| l.ends_with("/mux-verify-0")), "{ran}");
+
+    t.mux(&["uninstall"]);
+    assert_eq!(snapshot(&hooks), before);
+    assert!(!hooks.join("pre-commit").exists());
+}
+
+#[test]
+fn a_guarded_prepare_commit_msg_still_runs_between_pre_commit_and_commit_msg_in_the_slot() {
+    let t = T::new();
+    let hooks = t.repo.join(".git/hooks");
+    logging_hook(
+        &t,
+        &hooks.join("prepare-commit-msg"),
+        "printf 'area: ' | cat - \"$1\" > \"$1.new\" && mv \"$1.new\" \"$1\"",
+    );
+    t.mux(&["install"]);
+    let head = t.rev(&t.repo, "HEAD");
+    t.write("a.txt", "fixme\n");
+    let plain = git_env(
+        &t,
+        &t.repo,
+        &[],
+        &["commit", "-qam", "plain subject", "--no-verify"],
+    );
+    assert!(!plain.status.success());
+    assert!(stderr(&plain).contains("plain git commit in the shared checkout"));
+    assert_eq!(t.rev(&t.repo, "HEAD"), head);
+
+    t.mux(&["commit", "-m", "plain subject", "--", "a.txt"]);
+    assert_eq!(
+        t.sh(&t.repo, &["git", "log", "-1", "--format=%s"]),
+        "area: plain subject\n"
+    );
+    assert_eq!(t.head_file("a.txt"), "fixed\n");
 }

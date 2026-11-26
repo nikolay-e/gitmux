@@ -8,17 +8,20 @@ const HEADER: &str = "#!/bin/sh\n# Installed by git-mux (https://github.com/niko
 const MARK: &str = "# git-mux";
 const CHAINED: &str = "gitmux-chained";
 const REF_HOOK: &str = "reference-transaction";
-const GUARDED: [(&str, &str); 3] = [
+const GUARDED: [(&str, &str); 4] = [
     ("pre-commit", "commit"),
+    ("prepare-commit-msg", "commit open"),
     ("commit-msg", "commit"),
     ("pre-push", "push"),
 ];
 const CONFIGURED: [&str; 4] = ["pre-commit", "prepare-commit-msg", "commit-msg", "pre-push"];
 
 /// Written to `<common>/gitmux/guard`, outside the hooks dir; each hook calls it with its verb.
-/// Hooks never run in the live tree of the shared checkout, so GIT_MUX does not open it.
+/// No hook runs in the live tree of the shared checkout, so GIT_MUX opens only a guard line marked
+/// `open`: prepare-commit-msg's, the one hook the deliberate `GIT_MUX=1 git commit --no-verify` runs.
 const GUARD: &str = r#"# Linked worktrees are not guarded: there a commit or push touches no other session's files.
 [ "$(git rev-parse --absolute-git-dir)" = "$(git rev-parse --path-format=absolute --git-common-dir)" ] || exit 0
+[ "$2" = open ] && [ -n "$GIT_MUX" ] && exit 0
 echo "git-mux: plain git $1 in the shared checkout $(git rev-parse --show-toplevel) is refused:" \
   "its hooks would run among other sessions' unsaved files. Commit with: git mux commit -m MSG -- PATH...;" \
   "push with: git mux push, or push from a linked worktree or a bare clone" >&2
@@ -29,21 +32,29 @@ exit 1
 /// commits a remote already has (a plain pull sweeps in nothing local); gc re-packs a ref at its
 /// own value. A new stash is refused in the shared checkout only. HEAD is left to the tool hook:
 /// a branch switch and a new worktree's HEAD look alike here, and a switch rewrites files first.
-/// An all-zero id is a deletion in any hash length.
+/// An all-zero id is a deletion in any hash length: only the shared branch's is refused, except
+/// the one git's own pack-refs makes, which prunes the loose file of a ref already packed at the
+/// same value (a deletion by hand reports an all-zero old id first, or a loose-only ref).
 const REF_GATE: &str = "[ \"$1\" = prepared ] && [ -z \"$GIT_MUX\" ] || exit 0\n";
 
 const REF_CHECK: &str = r#"common=$(git rev-parse --path-format=absolute --git-common-dir)
 branch=$(git --git-dir="$common" symbolic-ref -q HEAD)
 while read -r old new ref; do
-  case "$new" in *[!0]*) ;; *) continue ;; esac
   case "$ref" in
     "$branch") ;;
     refs/stash) [ "$(git rev-parse --absolute-git-dir)" = "$common" ] || continue ;;
     *) continue ;;
   esac
+  case "$new" in
+    *[!0]*) ;;
+    *)
+      [ "$ref" = "$branch" ] || continue
+      [ -f "$common/$ref" ] && grep -Fxq "$old $ref" "$common/packed-refs" 2>/dev/null && continue
+      ;;
+  esac
   [ "$(git rev-parse -q --verify "$ref")" = "$new" ] && continue
   case "$old" in *[!0]*) existed=1 ;; *) existed= ;; esac
-  if [ "$ref" = "$branch" ] && [ -n "$existed" ] && git merge-base --is-ancestor "$old" "$new" &&
+  if [ "$ref" = "$branch" ] && [ -n "$existed" ] && git merge-base --is-ancestor "$old" "$new" 2>/dev/null &&
     [ -n "$(git for-each-ref --count=1 --contains "$new" refs/remotes)" ]; then
     continue
   fi
@@ -212,7 +223,13 @@ fn place(
     }
     let wrapper = format!("{HEADER}{line}exec \"$(dirname \"$0\")/{CHAINED}/{name}\" \"$@\"\n");
     match text {
-        Some(t) if !is_link(&hook) && t.starts_with(HEADER) => put(&hook, &wrapper),
+        Some(t) if !is_link(&hook) && t.starts_with(HEADER) => {
+            if exists(&hooks.join(CHAINED).join(name)) {
+                put(&hook, &wrapper)
+            } else {
+                put(&hook, &format!("{HEADER}{line}"))
+            }
+        }
         Some(t) if !is_link(&hook) && is_shell(&t) => {
             let new = with_line(&t, &line);
             if new != t {
@@ -271,6 +288,13 @@ pub fn ensure(repo: &Repo) -> Result<Vec<String>> {
     if !tracked_dir {
         let _ = fs::remove_file(hooks.join("mux-guard"));
     }
+    if !tracked_dir {
+        fs::create_dir_all(&hooks)?;
+        let pre_commit = hooks.join("pre-commit");
+        if !exists(&pre_commit) {
+            put(&pre_commit, &format!("{HEADER}{}", guard_line("commit")))?;
+        }
+    }
     for (name, verb) in GUARDED {
         place(&hooks, name, verb, tracked_dir, &mut notes)?;
     }
@@ -280,7 +304,6 @@ pub fn ensure(repo: &Repo) -> Result<Vec<String>> {
             hooks.display()
         ));
     } else {
-        fs::create_dir_all(&hooks)?;
         place_ref_hook(&hooks)?;
     }
     Ok(notes)
