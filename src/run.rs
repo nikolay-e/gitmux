@@ -61,6 +61,7 @@ impl Cmd {
         c.cmd
             .arg("--no-optional-locks")
             .current_dir(dir)
+            .env("GIT_LITERAL_PATHSPECS", "1")
             .env_remove("GIT_INDEX_FILE");
         c
     }
