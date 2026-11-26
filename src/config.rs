@@ -14,11 +14,19 @@ pub struct Config {
     pub slot_setup: Option<String>,
 }
 
-fn read(root: &Path, file: Option<&Path>) -> HashMap<String, Vec<String>> {
+enum Source<'a> {
+    All,
+    Local,
+    File(&'a Path),
+}
+
+fn read(root: &Path, source: Source) -> HashMap<String, Vec<String>> {
     let mut c = Cmd::git(root).arg("config");
-    if let Some(f) = file {
-        c = c.arg("-f").arg(f);
-    }
+    c = match source {
+        Source::All => c,
+        Source::Local => c.arg("--local"),
+        Source::File(f) => c.arg("-f").arg(f),
+    };
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
     if let Ok(out) = c.args(["-z", "--get-regexp", r"^gitmux\."]).out() {
         for item in String::from_utf8_lossy(&out.stdout)
@@ -71,13 +79,13 @@ impl Config {
     pub fn load(root: &Path, state: &Path) -> Config {
         let file = root.join(".gitmux");
         let shared = if file.is_file() {
-            read(root, Some(&file))
+            read(root, Source::File(&file))
         } else {
             HashMap::new()
         };
-        let local = read(root, None);
+        let configured = read(root, Source::All);
         let get = |k: &str| {
-            local
+            configured
                 .get(k)
                 .or_else(|| shared.get(k))
                 .cloned()
@@ -100,7 +108,7 @@ impl Config {
                 agents
             },
             components: one("gitmux.components").unwrap_or_else(|| "components.json".into()),
-            self_install: local
+            self_install: read(root, Source::Local)
                 .get("gitmux.selfinstall")
                 .and_then(|v| v.last())
                 .filter(|v| !v.is_empty())

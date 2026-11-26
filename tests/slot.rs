@@ -204,3 +204,24 @@ fn self_install_is_read_from_local_config_only() {
     let said = String::from_utf8_lossy(&o.stderr);
     assert!(said.contains("installing its git-mux failed"), "{said}");
 }
+
+/// A global `gitmux.selfInstall` is no more trusted than a committed one.
+#[test]
+fn a_global_self_install_is_ignored() {
+    let t = T::new();
+    fs::write(
+        t.tmp.join("home/.gitconfig"),
+        "[gitmux]\n\tselfInstall = tool\n",
+    )
+    .unwrap();
+    fs::create_dir(t.repo.join("tool")).unwrap();
+    t.write("tool/Cargo.toml", "this is not a manifest\n");
+    let o = t.mux(&["commit", "-m", "area: tool", "--", "tool/Cargo.toml"]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(!said.contains("installing"), "{said}");
+    assert_eq!(t.head_file("tool/Cargo.toml"), "this is not a manifest\n");
+}
