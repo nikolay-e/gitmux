@@ -42,7 +42,9 @@ is not run, because it would have to run in the live tree to mean anything.
 
 ## Install
 
-Tested on macOS and Linux with git 2.47 or newer.
+Needs git 2.40 or newer (`merge-tree --write-tree --merge-base`, `hook run --to-stdin`), 2.41 in a
+sparse checkout (`sparse-checkout check-rules -z`). Developed on macOS with git 2.56.1; CI uses the
+git its GitHub runners ship.
 
 From a release (static Linux builds for x86_64 and aarch64, macOS for x86_64 and arm64), built by
 the public repository's CI. The archive's checksum is listed in `SHA256SUMS`, and its build
