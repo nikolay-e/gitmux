@@ -1058,11 +1058,6 @@ pub fn guard_in(args: &[String], dir: Option<&Path>) -> Option<&'static str> {
     }
 }
 
-/// `guard_in` for a command whose directory is not known.
-pub fn guard_git(args: &[String]) -> Option<&'static str> {
-    guard_in(args, None)
-}
-
 /// The paths a `git mux commit …` names.
 pub fn commit_paths(args: &[String]) -> Vec<String> {
     if let Some(i) = args.iter().position(|a| a == "--") {

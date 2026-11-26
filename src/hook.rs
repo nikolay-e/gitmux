@@ -5,7 +5,7 @@ use crate::install::registered_roots;
 use crate::lease::{self, Owner, agent_process, alive, holder, short};
 use crate::repo::{Repo, inside, normalize, now, posix, read_json, resolve};
 use crate::run::{Result, zsplit};
-use crate::shell::{Kind, argv_invocations, commit_paths, guard_git, invocations, patch_paths};
+use crate::shell::{Kind, argv_invocations, commit_paths, guard_in, invocations, patch_paths};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 use std::fs;
@@ -347,7 +347,7 @@ fn bash(p: &Value, roots: &[Root], cwd: &Path, session: &str, owner: &Owner) -> 
                 touched.push(root);
             }
             if inv.kind == Kind::Git {
-                if let Some(why) = guard_git(&inv.args) {
+                if let Some(why) = guard_in(&inv.args, Some(&dir)) {
                     let shown: String = inv.args.join(" ").chars().take(60).collect();
                     return Ok(Decision::Deny(format!(
                         "`git {shown}` in the shared checkout {}: {why}.",
