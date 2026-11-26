@@ -2,7 +2,7 @@ use crate::journal::Journal;
 use crate::lease::{Owner, refuse_foreign};
 use crate::repo::{Entry, Repo, TempPath, strs, unique, write_atomic};
 use crate::run::{Cmd, Result, refuse, zsplit};
-use crate::slot::{run_hook, slot_at};
+use crate::slot::slot_at;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -107,7 +107,7 @@ pub fn verify(
     let msg = TempPath(unique(&repo.state, "msg-"));
     fs::write(&msg.0, message)?;
     let file = msg.0.to_string_lossy();
-    let run = |name: &str, args: &[&str]| run_hook(&slot.dir, name, args, None);
+    let run = |name: &str, args: &[&str]| slot.run_hook(name, args, None);
     let ok = run("pre-commit", &[])?
         && run("prepare-commit-msg", &[&file, "message"])?
         && run("commit-msg", &[&file])?;

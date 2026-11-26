@@ -3,15 +3,13 @@ use crate::run::{Cmd, Result, refuse, zsplit};
 use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
 
 const LOCK_REASON: &str = "git-mux verification slot";
 
-/// The checkout's effective hooks dir of the latest slot: what `run_hook` compares the slot with.
-static LIVE_HOOKS: Mutex<Option<PathBuf>> = Mutex::new(None);
-
 pub struct Slot {
     pub dir: PathBuf,
+    /// The checkout's effective hooks dir: what `run_hook` compares the slot's with.
+    live_hooks: Option<PathBuf>,
     _lock: File,
 }
 
@@ -61,7 +59,6 @@ pub fn slot_at(repo: &Repo, commit: &str, parent: Option<&str>) -> Result<Slot> 
         git().args(["reset", "--soft", "-q", p]).text()?;
     }
     copy_untracked_hooks(repo, &dir)?;
-    *LIVE_HOOKS.lock().unwrap_or_else(|e| e.into_inner()) = hooks_dir(&repo.root);
     if let Some(setup) = &repo.cfg.slot_setup {
         let out = Cmd::new("sh")
             .args(["-c", setup])
@@ -80,7 +77,11 @@ pub fn slot_at(repo: &Repo, commit: &str, parent: Option<&str>) -> Result<Slot> 
             );
         }
     }
-    Ok(Slot { dir, _lock: lock })
+    Ok(Slot {
+        dir,
+        live_hooks: hooks_dir(&repo.root),
+        _lock: lock,
+    })
 }
 
 fn hooks_dir(dir: &Path) -> Option<PathBuf> {
@@ -133,30 +134,29 @@ fn runs(hook: &Path) -> bool {
     fs::metadata(hook).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-pub fn run_hook(dir: &Path, name: &str, args: &[&str], stdin: Option<&Path>) -> Result<bool> {
-    let live = LIVE_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if let (Some(live), Some(mine)) = (live, hooks_dir(dir))
-        && runs(&live.join(name))
-        && !runs(&mine.join(name))
-    {
-        refuse!(
-            "the checkout has an executable {name} hook ({}) that the verification slot lacks ({}); commit it, or ignore it and keep it where the slot copies it from",
-            live.join(name).display(),
-            mine.join(name).display()
-        );
-    }
-    let mut c =
-        Cmd::git(dir)
+impl Slot {
+    pub fn run_hook(&self, name: &str, args: &[&str], stdin: Option<&Path>) -> Result<bool> {
+        if let (Some(live), Some(mine)) = (&self.live_hooks, hooks_dir(&self.dir))
+            && runs(&live.join(name))
+            && !runs(&mine.join(name))
+        {
+            refuse!(
+                "the checkout has an executable {name} hook ({}) that the verification slot lacks ({}); commit it, or ignore it and keep it where the slot copies it from",
+                live.join(name).display(),
+                mine.join(name).display()
+            );
+        }
+        let mut c = Cmd::git(&self.dir)
             .env_remove("GIT_LITERAL_PATHSPECS")
             .args(["hook", "run", "--ignore-missing"]);
-    if let Some(s) = stdin {
-        c = c.arg(format!("--to-stdin={}", s.display()));
+        if let Some(s) = stdin {
+            c = c.arg(format!("--to-stdin={}", s.display()));
+        }
+        c.arg(name).arg("--").args(args).status()
     }
-    c.arg(name).arg("--").args(args).status()
 }
 
 /// Unlocks and removes every slot git-mux made, in whatever directory it was created.
-#[allow(dead_code)]
 pub fn remove_all(repo: &Repo) -> Result<()> {
     let listing = repo
         .git()

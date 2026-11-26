@@ -1,7 +1,7 @@
 use crate::journal::Journal;
 use crate::repo::{Entry, Repo, TempPath, path_chunks, unique};
 use crate::run::{Result, refuse, zsplit};
-use crate::slot::{run_hook, slot_at};
+use crate::slot::slot_at;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
@@ -410,7 +410,7 @@ fn pre_push(repo: &Repo, remote: &str, commit: &str, line: &str) -> Result<()> {
     let url = repo.git().args(["remote", "get-url", remote]).text()?;
     let stdin = TempPath(unique(&repo.state, "pre-push-"));
     fs::write(&stdin.0, format!("{line}\n"))?;
-    if !run_hook(&slot.dir, "pre-push", &[remote, &url], Some(&stdin.0))? {
+    if !slot.run_hook("pre-push", &[remote, &url], Some(&stdin.0))? {
         refuse!("pre-push checks failed; nothing was pushed");
     }
     Ok(())
