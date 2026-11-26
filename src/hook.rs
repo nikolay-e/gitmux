@@ -2,7 +2,8 @@
 //! blocking signal both honour, so a refusal and a crash both end that way.
 use crate::commit::expand;
 use crate::install::registered_roots;
-use crate::repo::{Repo, agent_process, alive, holder, inside, now, read_json, short};
+use crate::lease::{agent_process, alive, holder, short};
+use crate::repo::{Repo, inside, now, read_json};
 use crate::run::{Result, zsplit};
 use crate::shell::{Kind, commit_paths, guard_git, invocations, patch_paths};
 use serde_json::{Map, Value, json};

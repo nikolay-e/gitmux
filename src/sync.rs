@@ -1,6 +1,7 @@
-use crate::commit::{Journal, run_hook, slot_at};
+use crate::journal::Journal;
 use crate::repo::{Repo, TempPath, unique};
 use crate::run::{Result, refuse, zsplit};
+use crate::slot::{run_hook, slot_at};
 use std::fs;
 
 /// Replays local commits onto the fetched upstream inside the object store, and refuses when
@@ -224,7 +225,11 @@ pub fn push(repo: &Repo) -> Result<()> {
 pub fn status(repo: &Repo) -> Result<()> {
     let held = repo.leases()?;
     for (p, v) in &held {
-        let gone = if crate::repo::alive(v) { "" } else { " (gone)" };
+        let gone = if crate::lease::alive(v) {
+            ""
+        } else {
+            " (gone)"
+        };
         println!("{p}\t{}{gone}", v["session"].as_str().unwrap_or("?"));
     }
     let loose: Vec<String> = repo

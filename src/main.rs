@@ -10,11 +10,15 @@
 //! never through the working tree or the shared index.
 mod commit;
 mod config;
+mod guard;
 mod hook;
 mod install;
+mod journal;
+mod lease;
 mod repo;
 mod run;
 mod shell;
+mod slot;
 mod sync;
 
 use run::{Refused, Result};
@@ -67,7 +71,7 @@ fn run(args: &[String]) -> Result<()> {
     }
     let repo = repo::Repo::open(&std::env::current_dir()?)?;
     install::ensure(&repo)?;
-    commit::heal(&repo)?;
+    journal::heal(&repo)?;
     match cmd {
         "commit" => {
             let (message, paths) = message_and_paths(&args[1..])?;

@@ -1,10 +1,10 @@
-use crate::repo::{Entry, Repo, TempPath, read_json, unique, write_atomic};
+use crate::journal::Journal;
+use crate::repo::{Entry, Repo, TempPath, strs, unique, write_atomic};
 use crate::run::{Cmd, Result, refuse, zsplit};
-use crate::sync::bring_tree;
-use serde_json::{Value, json};
+use crate::slot::{run_hook, slot_at};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -55,106 +55,6 @@ pub fn expand(repo: &Repo, args: &[String], base: Option<&Path>) -> Result<Vec<S
     let mut seen = BTreeSet::new();
     paths.retain(|p| seen.insert(p.clone()));
     Ok(paths)
-}
-
-pub struct Slot {
-    pub dir: PathBuf,
-    _lock: File,
-}
-
-/// A persistent detached worktree where hooks judge one exact commit, away from the live files.
-pub fn slot_at(repo: &Repo, commit: &str, parent: Option<&str>) -> Result<Slot> {
-    let mut chosen = None;
-    for i in 0..repo.cfg.slots {
-        let f = File::create(repo.state.join(format!("slot-{i}.lock")))?;
-        if f.try_lock().is_ok() {
-            chosen = Some((i, f));
-            break;
-        }
-    }
-    let (i, lock) = match chosen {
-        Some(c) => c,
-        None => {
-            eprintln!("git-mux: every verification slot is busy; waiting for slot 0");
-            let f = File::create(repo.state.join("slot-0.lock"))?;
-            f.lock()?;
-            (0, f)
-        }
-    };
-    let dir = repo.cfg.slot_dir.join(format!("mux-verify-{i}"));
-    if !dir.join(".git").exists() {
-        repo.git().args(["worktree", "prune"]).text()?;
-        fs::create_dir_all(&repo.cfg.slot_dir)?;
-        repo.git()
-            .args(["worktree", "add", "-f", "-f", "--detach"])
-            .arg(&dir)
-            .arg(repo.head()?)
-            .text()?;
-    }
-    // Locked, so worktree cleanup never deletes a slot and the dependencies built inside it.
-    let _ = repo
-        .git()
-        .args(["worktree", "lock", "--reason", "git-mux verification slot"])
-        .arg(&dir)
-        .out();
-    let git = || Cmd::git(&dir);
-    git()
-        .args(["checkout", "--detach", "--force", "-q", commit])
-        .text()?;
-    git().args(["clean", "-fdq"]).text()?;
-    // With HEAD at the parent and the index at the commit, the hooks see exactly what a plain
-    // `git commit` of this change would show them.
-    if let Some(p) = parent {
-        git().args(["reset", "--soft", "-q", p]).text()?;
-    }
-    provision_node_modules(repo, &dir)?;
-    Ok(Slot { dir, _lock: lock })
-}
-
-/// Hooks resolve their tools from node_modules beside each lockfile. A copy-on-write clone of
-/// the live directory costs no blocks and keeps realpath() inside the slot.
-fn provision_node_modules(repo: &Repo, slot: &Path) -> Result<()> {
-    let locks = repo
-        .git()
-        .args([
-            "ls-files",
-            "-z",
-            "--",
-            "package-lock.json",
-            "*/package-lock.json",
-        ])
-        .raw()?;
-    for lock in zsplit(&locks) {
-        let parent = Path::new(&lock).parent().unwrap_or(Path::new(""));
-        let (live, mine) = (
-            repo.root.join(parent).join("node_modules"),
-            slot.join(parent).join("node_modules"),
-        );
-        if !live.is_dir() {
-            continue;
-        }
-        let stamp = ".package-lock.json";
-        if mine.is_dir() && fs::read(live.join(stamp)).ok() == fs::read(mine.join(stamp)).ok() {
-            continue;
-        }
-        let _ = fs::remove_dir_all(&mine);
-        fs::create_dir_all(mine.parent().unwrap())?;
-        let cp = if cfg!(target_os = "macos") {
-            Cmd::new("cp").args(["-c", "-R"])
-        } else {
-            Cmd::new("cp").args(["-R", "--reflink=auto"])
-        };
-        cp.arg(&live).arg(&mine).text()?;
-    }
-    Ok(())
-}
-
-pub fn run_hook(dir: &Path, name: &str, args: &[&str], stdin: Option<&Path>) -> Result<bool> {
-    let mut c = Cmd::git(dir).args(["hook", "run", "--ignore-missing"]);
-    if let Some(s) = stdin {
-        c = c.arg(format!("--to-stdin={}", s.display()));
-    }
-    c.arg(name).arg("--").args(args).status()
 }
 
 pub struct Verdict {
@@ -222,16 +122,6 @@ fn apply_fixes(
         }
     }
     Ok((applied, clashed))
-}
-
-fn strs(v: &Value) -> Vec<String> {
-    v.as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|s| s.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// The path prefixes no component claims, and those the candidate's components, their
@@ -471,93 +361,4 @@ fn self_install(repo: &Repo, commit: &str, paths: &[String]) {
         Ok(exe) => println!("git-mux: installed the landed git-mux at {}", exe.display()),
         Err(e) => eprintln!("git-mux: the commit landed, but installing its git-mux failed: {e}"),
     }
-}
-
-/// A publish moves the branch first and the shared index (and, for sync, the files) after. A
-/// process killed or refused in between leaves its journal behind, locked by nobody: the next
-/// git-mux run finishes the second half, for the paths that still hold the old state.
-pub struct Journal {
-    path: PathBuf,
-    _file: File,
-}
-
-impl Journal {
-    pub fn open(
-        repo: &Repo,
-        kind: &str,
-        old: &str,
-        new: &str,
-        paths: &[String],
-    ) -> Result<Journal> {
-        let tmp = unique(&repo.state, "journal-");
-        let mut f = File::create(&tmp)?;
-        f.lock()?;
-        f.write_all(
-            json!({"kind": kind, "old": old, "new": new, "paths": paths})
-                .to_string()
-                .as_bytes(),
-        )?;
-        f.flush()?;
-        let path = repo
-            .state
-            .join(format!("publish.{}.json", std::process::id()));
-        fs::rename(&tmp, &path)?;
-        Ok(Journal { path, _file: f })
-    }
-
-    pub fn finish(self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-pub fn heal(repo: &Repo) -> Result<()> {
-    for entry in fs::read_dir(&repo.state)? {
-        let path = entry?.path();
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if !(name.starts_with("publish.") && name.ends_with(".json")) {
-            continue;
-        }
-        let Ok(f) = File::open(&path) else { continue };
-        if f.try_lock().is_err() || !path.exists() {
-            continue;
-        }
-        let Some(j) = read_json(&path) else {
-            let _ = fs::remove_file(&path);
-            continue;
-        };
-        let (kind, old, new) = (
-            j["kind"].as_str().unwrap_or(""),
-            j["old"].as_str().unwrap_or(""),
-            j["new"].as_str().unwrap_or(""),
-        );
-        let paths = strs(&j["paths"]);
-        let landed = repo
-            .git()
-            .args(["merge-base", "--is-ancestor", new, &repo.head()?])
-            .out()?
-            .ok();
-        if landed && kind == "commit" {
-            repo.sync_index(old, new, &paths)?;
-        } else if landed {
-            let before = repo.entries(old, &paths)?;
-            let mut stale = Vec::new();
-            for p in &paths {
-                let live = fs::read(repo.root.join(p)).ok();
-                let was = before.get(p).map(|(_, oid)| repo.blob(oid)).transpose()?;
-                if live == was {
-                    stale.push(p.clone());
-                }
-            }
-            bring_tree(repo, new, &stale)?;
-        }
-        let _ = fs::remove_file(&path);
-        eprintln!(
-            "git-mux: finished the interrupted {kind} of {}",
-            new.get(..10).unwrap_or(new)
-        );
-    }
-    Ok(())
 }
