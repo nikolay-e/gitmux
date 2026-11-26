@@ -154,40 +154,49 @@ struct Agent {
     events: Vec<(&'static str, Option<&'static str>)>,
 }
 
-/// Claude Code and Codex, for those whose config directory exists.
-fn agents(home: &Path) -> Vec<Agent> {
-    let claude_edit = "Bash|Edit|Write|MultiEdit|NotebookEdit";
-    vec![
-        Agent {
-            name: "Claude Code",
-            file: home.join(".claude/settings.json"),
-            events: vec![
-                ("PreToolUse", Some(claude_edit)),
-                ("PostToolUse", Some("Bash")),
-                ("PostToolUseFailure", Some("Bash")),
-                ("PermissionDenied", Some("Bash")),
-                ("Stop", None),
-                ("SubagentStop", None),
-                ("SessionStart", None),
-                ("SessionEnd", None),
-            ],
-        },
-        Agent {
-            name: "Codex",
-            file: home.join(".codex/hooks.json"),
-            events: vec![
-                ("PreToolUse", Some("^(Bash|apply_patch|Edit|Write)$")),
-                ("PostToolUse", Some("^Bash$")),
-                ("Stop", None),
-                ("Interrupt", None),
-                ("SessionStart", None),
-                ("SessionEnd", None),
-            ],
-        },
-    ]
-    .into_iter()
-    .filter(|a| a.file.parent().is_some_and(Path::is_dir))
-    .collect()
+/// An agent's user-level config file: the directory its own variable names when that is set and
+/// non-empty, else `$HOME/<default_dir>`.
+fn config_file(var: &str, default_dir: &str, name: &str) -> Option<PathBuf> {
+    let dir = std::env::var_os(var)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(default_dir)))?;
+    Some(dir.join(name))
+}
+
+/// Claude Code and Codex, for those whose config file resolves and whose directory exists.
+fn agents() -> Vec<Agent> {
+    let claude = config_file("CLAUDE_CONFIG_DIR", ".claude", "settings.json").map(|file| Agent {
+        name: "Claude Code",
+        file,
+        events: vec![
+            ("PreToolUse", Some("Bash|Edit|Write|MultiEdit|NotebookEdit")),
+            ("PostToolUse", Some("Bash")),
+            ("PostToolUseFailure", Some("Bash")),
+            ("PermissionDenied", Some("Bash")),
+            ("Stop", None),
+            ("SubagentStop", None),
+            ("SessionStart", None),
+            ("SessionEnd", None),
+        ],
+    });
+    let codex = config_file("CODEX_HOME", ".codex", "hooks.json").map(|file| Agent {
+        name: "Codex",
+        file,
+        events: vec![
+            ("PreToolUse", Some("^(Bash|apply_patch|Edit|Write)$")),
+            ("PostToolUse", Some("^Bash$")),
+            ("Stop", None),
+            ("Interrupt", None),
+            ("SessionStart", None),
+            ("SessionEnd", None),
+        ],
+    });
+    [claude, codex]
+        .into_iter()
+        .flatten()
+        .filter(|a| a.file.parent().is_some_and(Path::is_dir))
+        .collect()
 }
 
 fn project_file(repo: &Repo) -> PathBuf {
@@ -246,24 +255,20 @@ pub fn install(repo: &Repo, project: bool) -> Result<()> {
     let command = format!("[ -x {0} ] || exit 0; exec {0} hook", quoted(&exe));
     let hook =
         json!({"type": "command", "command": command, "timeout": 30, "statusMessage": "git-mux"});
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        for agent in agents(&home) {
-            let changed = wire(&agent.file, &agent.events, &hook)?;
-            println!(
-                "git-mux: {} hooks in {} {}",
-                agent.name,
-                agent.file.display(),
-                if changed {
-                    "updated"
-                } else {
-                    "already current"
-                }
-            );
-            if changed && agent.name == "Codex" {
-                println!(
-                    "git-mux: Codex runs a changed hook only after you trust it once with /hooks"
-                );
+    for agent in agents() {
+        let changed = wire(&agent.file, &agent.events, &hook)?;
+        println!(
+            "git-mux: {} hooks in {} {}",
+            agent.name,
+            agent.file.display(),
+            if changed {
+                "updated"
+            } else {
+                "already current"
             }
+        );
+        if changed && agent.name == "Codex" {
+            println!("git-mux: Codex runs a changed hook only after you trust it once with /hooks");
         }
     }
     if project {
@@ -291,10 +296,8 @@ pub fn uninstall(repo: &Repo) -> Result<()> {
         .filter(|r| *r != root && r.is_dir())
         .collect();
     save_registry(&remaining)?;
-    if remaining.is_empty()
-        && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
-    {
-        for agent in agents(&home) {
+    if remaining.is_empty() {
+        for agent in agents() {
             if unwire(&agent.file)? {
                 println!(
                     "git-mux: {} hooks removed from {}",

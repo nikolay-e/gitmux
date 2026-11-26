@@ -382,3 +382,55 @@ fn uninstall_gives_every_hook_back_and_the_last_repo_takes_the_agents_along() {
     );
     assert!(!home.join(".codex/hooks.json").exists());
 }
+
+#[test]
+fn the_agents_own_variables_name_the_files_install_and_uninstall_touch() {
+    let t = T::new();
+    let home = agent_dirs(&t);
+    let claude_dir = t.tmp.join("claude-config");
+    let codex_dir = t.tmp.join("codex-home");
+    fs::create_dir_all(&claude_dir).unwrap();
+    fs::create_dir_all(&codex_dir).unwrap();
+    let home_claude = home.join(".claude/settings.json");
+    let home_codex = home.join(".codex/hooks.json");
+    let theirs = r#"{"model": "x"}"#;
+    fs::write(&home_claude, theirs).unwrap();
+    fs::write(&home_codex, "{}").unwrap();
+    let env: [(&str, &Path); 2] = [
+        ("CLAUDE_CONFIG_DIR", &claude_dir),
+        ("CODEX_HOME", &codex_dir),
+    ];
+    let ok = |o: Output| assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    ok(t.run(&["install"], &env));
+    assert!(!ours(&json_at(&claude_dir.join("settings.json"))).is_empty());
+    assert!(!ours(&json_at(&codex_dir.join("hooks.json"))).is_empty());
+    assert_eq!(fs::read_to_string(&home_claude).unwrap(), theirs);
+    assert_eq!(fs::read_to_string(&home_codex).unwrap(), "{}");
+
+    ok(t.run(&["uninstall"], &env));
+    assert!(!claude_dir.join("settings.json").exists());
+    assert!(!codex_dir.join("hooks.json").exists());
+    assert_eq!(fs::read_to_string(&home_claude).unwrap(), theirs);
+    assert_eq!(fs::read_to_string(&home_codex).unwrap(), "{}");
+
+    t.mux(&["install"]);
+    assert!(!ours(&json_at(&home_claude)).is_empty());
+    assert!(!ours(&json_at(&home_codex)).is_empty());
+    assert!(!claude_dir.join("settings.json").exists());
+    assert!(!codex_dir.join("hooks.json").exists());
+}
+
+#[test]
+fn an_empty_variable_or_a_missing_directory_wires_nothing_else() {
+    let t = T::new();
+    let home = agent_dirs(&t);
+    let missing = t.tmp.join("no-such-dir");
+    let empty = Path::new("");
+    let env: [(&str, &Path); 2] = [("CLAUDE_CONFIG_DIR", empty), ("CODEX_HOME", &missing)];
+    let o = t.run(&["install"], &env);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!ours(&json_at(&home.join(".claude/settings.json"))).is_empty());
+    assert!(!home.join(".codex/hooks.json").exists());
+    assert!(!missing.exists());
+}
