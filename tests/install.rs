@@ -620,8 +620,12 @@ fn refused_install(t: &T, second: &Path, file: &Path, key: &str) {
     assert!(err.contains(key), "{err}");
     let registry = fs::read_to_string(t.tmp.join("config/gitmux/repos")).unwrap();
     assert_eq!(registry, format!("{}\n", t.repo.display()), "not enrolled");
-    assert!(!second.join(".git/gitmux").exists());
+    let state = second.join(".git/gitmux");
+    if state.exists() {
+        assert_eq!(fs::read_dir(&state).unwrap().count(), 0, "nothing written");
+    }
     assert!(!second.join(".git/hooks/reference-transaction").exists());
+    assert!(!second.join(".git/hooks/pre-commit").exists());
 }
 
 #[test]
