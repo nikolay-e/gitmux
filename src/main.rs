@@ -25,10 +25,13 @@ use run::{Refused, Result};
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: git mux commit -m MSG [--take] [--] PATH...
-       git mux sync      replay local commits onto the upstream, sparing files in use
-       git mux push      sync, run the pre-push hooks in a slot, push that exact commit
+       git mux sync      replay local commits onto the upstream; refuses when an incoming file is edited or staged here
+       git mux push [REF...]  sync, run the pre-push hooks in a slot, push that exact commit (or each REF)
        git mux status    who holds which uncommitted file
-       git mux install   guard this checkout and wire the Claude Code / Codex hooks
+       git mux install [--project]  enroll and guard this checkout, wire the Claude Code / Codex hooks
+                         (--project: also this checkout's own fail-closed Claude Code hooks)
+       git mux uninstall take this checkout out of git-mux again
+       git mux --version
        git mux hook      (called by the agents around every tool call)";
 
 fn message_and_paths(args: &[String]) -> Result<(String, Vec<String>, bool)> {
@@ -66,16 +69,34 @@ fn message_and_paths(args: &[String]) -> Result<(String, Vec<String>, bool)> {
     ))
 }
 
+fn install_project(args: &[String]) -> Result<bool> {
+    match args {
+        [] => Ok(false),
+        [flag] if flag == "--project" => Ok(true),
+        _ => Err(Refused(USAGE.into())),
+    }
+}
+
 fn run(args: &[String]) -> Result<()> {
     let cmd = args.first().map(String::as_str).unwrap_or("");
-    if !matches!(cmd, "commit" | "sync" | "push" | "status" | "install") {
+    if !matches!(
+        cmd,
+        "commit" | "sync" | "push" | "status" | "install" | "uninstall"
+    ) {
         return Err(Refused(USAGE.into()));
     }
+    let project = if cmd == "install" {
+        install_project(&args[1..])?
+    } else {
+        false
+    };
     let repo = repo::Repo::open(&std::env::current_dir()?)?;
-    let notes = install::ensure(&repo)?;
-    if matches!(cmd, "install" | "status") {
-        for note in notes {
-            eprintln!("{note}");
+    if cmd != "uninstall" {
+        let notes = install::ensure(&repo, cmd == "install")?;
+        if matches!(cmd, "install" | "status") {
+            for note in notes {
+                eprintln!("{note}");
+            }
         }
     }
     journal::heal(&repo)?;
@@ -87,7 +108,8 @@ fn run(args: &[String]) -> Result<()> {
         "sync" => sync::sync(&repo),
         "push" => sync::push(&repo, &args[1..]),
         "status" => sync::status(&repo),
-        _ => install::install(&repo),
+        "uninstall" => install::uninstall(&repo),
+        _ => install::install(&repo, project),
     }
 }
 

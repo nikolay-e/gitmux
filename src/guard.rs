@@ -305,7 +305,6 @@ fn restore(hooks: &Path, name: &str) -> Result<()> {
 
 /// Takes git-mux out of the hooks dir: marker lines dropped, chained hooks restored byte for
 /// byte, wrappers, the reference-transaction guard and the guard script deleted.
-#[allow(dead_code)]
 pub fn remove(repo: &Repo) -> Result<()> {
     let hooks = hooks_dir(repo)?;
     if !tracked(repo, &hooks) {
