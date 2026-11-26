@@ -221,10 +221,6 @@ fn status_in_a_fresh_repository_enrolls_nothing() {
     fs::create_dir_all(&fresh).unwrap();
     t.sh(&fresh, &["git", "init", "-q", "-b", "main"]);
     configure(&t, &fresh);
-    t.sh(
-        &fresh,
-        &["git", "commit", "-q", "--allow-empty", "-m", "init"],
-    );
     let hooks = fresh.join(".git/hooks");
     fs::write(hooks.join("pre-commit"), "#!/bin/sh\nexit 0\n").unwrap();
     t.sh(&fresh, &["chmod", "+x", ".git/hooks/pre-commit"]);
@@ -237,6 +233,54 @@ fn status_in_a_fresh_repository_enrolls_nothing() {
     );
     assert!(!hooks.join("reference-transaction").exists());
     assert!(!fresh.join(".git/gitmux/guard").exists());
+}
+
+#[test]
+fn a_repository_with_no_commit_installs_reports_and_uninstalls() {
+    let t = T::new();
+    let fresh = t.tmp.join("unborn");
+    fs::create_dir_all(&fresh).unwrap();
+    t.sh(&fresh, &["git", "init", "-q", "-b", "main"]);
+    configure(&t, &fresh);
+    fs::write(fresh.join("a.txt"), "a\n").unwrap();
+    mux_in(&t, &fresh, &["install"]);
+    mux_in(&t, &fresh, &["status"]);
+    let hooks = fresh.join(".git/hooks");
+    assert!(hooks.join("reference-transaction").exists());
+
+    let o = cmd(BIN, &t.tmp)
+        .args(["commit", "-m", "t: first", "a.txt"])
+        .current_dir(&fresh)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success());
+    assert_eq!(
+        err.trim().lines().count(),
+        1,
+        "one clear line, not git's bad revision: {err}"
+    );
+    assert!(
+        err.contains("no commit yet") && !err.contains("bad revision"),
+        "{err}"
+    );
+    assert!(!fresh.join(".git/refs/heads/main").exists());
+
+    t.sh(&fresh, &["git", "add", "a.txt"]);
+    let first = cmd("git", &t.tmp)
+        .env("GIT_MUX", "1")
+        .args(["commit", "-q", "--no-verify", "-m", "t: first"])
+        .current_dir(&fresh)
+        .status()
+        .unwrap();
+    assert!(first.success(), "the message's advice works");
+    fs::write(fresh.join("a.txt"), "a2\n").unwrap();
+    mux_in(&t, &fresh, &["commit", "-m", "t: second", "a.txt"]);
+    assert_eq!(t.sh(&fresh, &["git", "rev-list", "--count", "HEAD"]), "2\n");
+
+    mux_in(&t, &fresh, &["uninstall"]);
+    assert!(!hooks.join("reference-transaction").exists());
+    assert!(!fresh.join(".git/gitmux").exists());
 }
 
 #[test]

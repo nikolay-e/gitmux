@@ -71,7 +71,28 @@ impl Repo {
     }
 
     pub fn head(&self) -> Result<String> {
-        self.git().args(["rev-parse", &self.refname]).text()
+        let out = self
+            .git()
+            .args(["rev-parse", "-q", "--verify", &self.refname])
+            .out()?;
+        if !out.ok() {
+            refuse!(
+                "{} has no commit yet; make the first one with GIT_MUX=1 git commit --no-verify, then git mux commit works",
+                self.branch
+            );
+        }
+        Ok(out.text())
+    }
+
+    /// What uncommitted work is measured against: HEAD, or the empty tree before the first commit.
+    fn baseline(&self) -> Result<String> {
+        match self.head() {
+            Ok(head) => Ok(head),
+            Err(_) => self
+                .git()
+                .args(["hash-object", "-t", "tree", "/dev/null"])
+                .text(),
+        }
     }
 
     pub fn lock(&self, name: &str) -> Result<File> {
@@ -86,12 +107,13 @@ impl Repo {
         if paths.is_empty() {
             return Ok(BTreeSet::new());
         }
+        let baseline = self.baseline()?;
         let mut out = BTreeSet::new();
         for chunk in path_chunks(paths) {
             out.extend(zsplit(
                 &self
                     .git()
-                    .args(["diff", "--name-only", "-z", "HEAD", "--"])
+                    .args(["diff", "--name-only", "-z", &baseline, "--"])
                     .args(chunk)
                     .raw()?,
             ));
