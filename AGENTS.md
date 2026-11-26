@@ -94,10 +94,10 @@ each other's work.
 - An agent's environment can switch git hooks off: Gemini injects `core.hooksPath=""` through
   `GIT_CONFIG_COUNT` for every command it runs, and `git hook run` would then verify nothing. So
   git-mux's own git calls drop an injected `core.hooksPath` (other injected pairs stay), and
-  `commit` and `push` refuse a `core.hooksPath` from `GIT_CONFIG_PARAMETERS`, which is what
-  `git -c core.hooksPath=…` writes and cannot be dropped. Under Gemini the git layer never fires
-  for its own commands; only the agent hook guards there. Gemini runs hooks only in trusted
-  folders, and its hooks are user-level only: it has no fail-closed project file.
+  every git-mux command except `hook` refuses a `core.hooksPath` from `GIT_CONFIG_PARAMETERS`,
+  which is what `git -c core.hooksPath=…` writes and cannot be dropped. Under Gemini the git layer
+  never fires for its own commands; only the agent hook guards there. Gemini runs hooks only in
+  trusted folders, and its hooks are user-level only: it has no fail-closed project file.
 - Every git call runs with `GIT_LITERAL_PATHSPECS=1` so `[id]` paths stay literal; what runs user
   code (hooks, `slotSetup`) or needs a glob has it removed. `slotSetup` is shell run for anyone
   who commits in the checkout, the same trust as its hooks; `selfInstall` replaces the binary, so

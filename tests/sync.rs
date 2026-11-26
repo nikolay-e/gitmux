@@ -380,3 +380,22 @@ fn a_ref_that_fails_pre_push_leaves_the_remote_untouched() {
     assert!(!t.git_ok(&remote, &["rev-parse", "-q", "--verify", "refs/tags/bad"]));
     assert_eq!(t.rev(&remote, "main"), before);
 }
+
+#[test]
+fn a_hooks_path_given_with_dash_c_refuses_push_and_status_and_writes_nothing() {
+    let t = T::new();
+    let remote = t.with_remote();
+    t.write("a.txt", "local\n");
+    t.mux(&["commit", "-m", "area: local a", "--", "a.txt"]);
+    let (pushed, hooks) = (t.rev(&remote, "main"), t.tmp.join("elsewhere"));
+    fs::create_dir(&hooks).unwrap();
+    let parameters = format!("'core.hookspath'='{}'", hooks.display());
+    for args in [&["push"][..], &["status"]] {
+        let o = t.run(args, &[("GIT_CONFIG_PARAMETERS", Path::new(&parameters))]);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success(), "{args:?}: {err}");
+        assert!(err.contains("core.hooksPath"), "{args:?}: {err}");
+        assert_eq!(fs::read_dir(&hooks).unwrap().count(), 0, "{args:?}");
+    }
+    assert_eq!(t.rev(&remote, "main"), pushed);
+}

@@ -90,6 +90,7 @@ fn run(args: &[String]) -> Result<()> {
     } else {
         false
     };
+    run::refuse_hooks_path_parameter()?;
     let repo = repo::Repo::open(&std::env::current_dir()?)?;
     if cmd != "uninstall" {
         let notes = install::ensure(&repo, cmd == "install")?;

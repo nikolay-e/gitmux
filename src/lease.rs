@@ -1,5 +1,5 @@
 use crate::repo::{Repo, now, read_json, write_atomic};
-use crate::run::{Cmd, Result, refuse, refuse_hooks_path_parameter};
+use crate::run::{Cmd, Result, refuse};
 use serde_json::{Map, Value, json};
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashMap};
@@ -294,7 +294,6 @@ pub fn alive(lease: &Value) -> bool {
 
 /// Refuses paths another live owner holds, unless the caller was told to take them over.
 pub fn refuse_foreign(repo: &Repo, paths: &[String], owner: &Owner, take: bool) -> Result<()> {
-    refuse_hooks_path_parameter()?;
     if take {
         return Ok(());
     }
