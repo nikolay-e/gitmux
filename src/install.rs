@@ -62,11 +62,15 @@ fn is_ours(hook: &Value) -> bool {
 }
 
 fn read_config(file: &Path) -> Result<Value> {
-    match fs::read(file) {
-        Ok(data) => serde_json::from_slice(&data)
-            .map_err(|e| crate::run::Refused(format!("{}: {e}", file.display()))),
-        Err(_) => Ok(json!({})),
+    let Ok(data) = fs::read(file) else {
+        return Ok(json!({}));
+    };
+    let config: Value = serde_json::from_slice(&data)
+        .map_err(|e| crate::run::Refused(format!("{}: {e}", file.display())))?;
+    if !config.is_object() {
+        refuse!("{}: the top level is not a JSON object", file.display());
     }
+    Ok(config)
 }
 
 fn write_config(file: &Path, config: &Value) -> Result<()> {
@@ -78,19 +82,27 @@ fn write_config(file: &Path, config: &Value) -> Result<()> {
     )
 }
 
-/// Removes every git-mux handler, whatever event it sits on, and the groups that leave empty.
+/// Removes every git-mux handler, whatever event it sits on, and the groups and events that
+/// leave empty. Whatever else the file holds, a value of another shape included, stays as it was.
 fn strip_ours(config: &mut Value) {
-    let Some(events) = config["hooks"].as_object_mut() else {
+    let Some(events) = config.get_mut("hooks").and_then(Value::as_object_mut) else {
         return;
     };
-    for groups in events.values_mut().filter_map(Value::as_array_mut) {
-        for g in groups.iter_mut() {
-            if let Some(hs) = g["hooks"].as_array_mut() {
-                hs.retain(|h| !is_ours(h));
-            }
-        }
-        groups.retain(|g| g["hooks"].as_array().is_none_or(|hs| !hs.is_empty()));
-    }
+    events.retain(|_, groups| {
+        let Some(groups) = groups.as_array_mut() else {
+            return true;
+        };
+        let before = groups.len();
+        groups.retain_mut(|group| {
+            let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                return true;
+            };
+            let had = hooks.len();
+            hooks.retain(|h| !is_ours(h));
+            !hooks.is_empty() || hooks.len() == had
+        });
+        groups.len() == before || !groups.is_empty()
+    });
 }
 
 /// Replaces any earlier git-mux entry in one hook config with `hook` on each of `events`.
@@ -98,19 +110,23 @@ fn wire(file: &Path, events: &[(&str, Option<&str>)], hook: &Value) -> Result<bo
     let mut config = read_config(file)?;
     let before = config.clone();
     strip_ours(&mut config);
-    if !config["hooks"].is_object() {
-        config["hooks"] = json!({});
+    let root = config.as_object_mut().unwrap();
+    if !root.get("hooks").is_some_and(Value::is_object) {
+        root.insert("hooks".into(), json!({}));
     }
+    let wired = root
+        .get_mut("hooks")
+        .and_then(Value::as_object_mut)
+        .unwrap();
     for (event, matcher) in events {
-        let mut groups = config["hooks"][event]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        groups.push(match matcher {
+        let slot = wired.entry(*event).or_insert(Value::Null);
+        if !slot.is_array() {
+            *slot = json!([]);
+        }
+        slot.as_array_mut().unwrap().push(match matcher {
             Some(m) => json!({"matcher": m, "hooks": [hook]}),
             None => json!({"hooks": [hook]}),
         });
-        config["hooks"][event] = Value::Array(groups);
     }
     if config == before {
         return Ok(false);
@@ -127,16 +143,18 @@ fn unwire(file: &Path) -> Result<bool> {
     let mut config = read_config(file)?;
     let before = config.clone();
     strip_ours(&mut config);
-    if let Some(events) = config["hooks"].as_object_mut() {
-        events.retain(|_, v| v.as_array().is_none_or(|g| !g.is_empty()));
-        if events.is_empty() {
-            config.as_object_mut().unwrap().remove("hooks");
-        }
-    }
     if config == before {
         return Ok(false);
     }
-    if config.as_object().is_some_and(|o| o.is_empty()) {
+    let root = config.as_object_mut().unwrap();
+    if root
+        .get("hooks")
+        .and_then(Value::as_object)
+        .is_some_and(|events| events.is_empty())
+    {
+        root.remove("hooks");
+    }
+    if root.is_empty() {
         fs::remove_file(file)?;
     } else {
         write_config(file, &config)?;

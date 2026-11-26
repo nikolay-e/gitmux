@@ -547,3 +547,56 @@ fn a_gemini_settings_file_that_is_not_json_is_refused_by_name() {
     assert!(String::from_utf8_lossy(&o.stderr).contains(&*file.to_string_lossy()));
     assert_eq!(fs::read_to_string(&file).unwrap(), "{ // comment\n}");
 }
+
+#[test]
+fn uninstall_leaves_a_settings_file_without_hooks_byte_identical() {
+    let t = T::new();
+    let home = t.tmp.join("home");
+    let theirs = "{\"theme\":  \"dark\",\n \"tools\": {\"allowed\": []}}";
+    let gemini = home.join(".gemini/settings.json");
+    let local = t.repo.join(".claude/settings.local.json");
+    fs::create_dir_all(local.parent().unwrap()).unwrap();
+    t.mux(&["install", "--project"]);
+    fs::create_dir_all(home.join(".gemini")).unwrap();
+    for file in [&gemini, &local] {
+        fs::write(file, theirs).unwrap();
+    }
+    t.mux(&["uninstall"]);
+    for file in [&gemini, &local] {
+        assert_eq!(fs::read_to_string(file).unwrap(), theirs, "{file:?}");
+    }
+}
+
+#[test]
+fn settings_of_other_shapes_survive_install_and_uninstall() {
+    let t = T::new();
+    let home = t.tmp.join("home");
+    fs::create_dir_all(home.join(".gemini")).unwrap();
+    let file = home.join(".gemini/settings.json");
+    let theirs = json!({"hooks": {
+        "disabled": ["x"],
+        "Notification": [],
+        "Other": "not a list",
+        "BeforeTool": [{"matcher": "^mcp_"}, {"matcher": "^other$", "hooks": []}]}});
+    fs::write(&file, theirs.to_string()).unwrap();
+    t.mux(&["install"]);
+    let wired = json_at(&file);
+    assert_eq!(wired["hooks"]["BeforeTool"].as_array().unwrap().len(), 3);
+    assert_eq!(wired["hooks"]["disabled"], json!(["x"]));
+    t.mux(&["uninstall"]);
+    assert_eq!(json_at(&file), theirs);
+}
+
+#[test]
+fn a_settings_file_whose_top_level_is_not_an_object_is_refused_by_name() {
+    let t = T::new();
+    let home = t.tmp.join("home");
+    fs::create_dir_all(home.join(".gemini")).unwrap();
+    let file = home.join(".gemini/settings.json");
+    fs::write(&file, "[]").unwrap();
+    let o = t.run(&["install"], &[]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success(), "{err}");
+    assert!(err.contains(&*file.to_string_lossy()), "{err}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "[]");
+}
