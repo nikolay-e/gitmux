@@ -75,16 +75,7 @@ pub fn heal(repo: &Repo) -> Result<()> {
         if landed && kind == "commit" {
             repo.sync_index(old, new, &paths)?;
         } else if landed {
-            let before = repo.entries(old, &paths)?;
-            let mut stale = Vec::new();
-            for p in &paths {
-                let live = fs::read(repo.root.join(p)).ok();
-                let was = before.get(p).map(|(_, oid)| repo.blob(oid)).transpose()?;
-                if live == was {
-                    stale.push(p.clone());
-                }
-            }
-            bring_tree(repo, new, &stale)?;
+            bring_tree(repo, old, new, &paths)?;
         }
         let _ = fs::remove_file(&path);
         eprintln!(
