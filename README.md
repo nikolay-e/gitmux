@@ -82,8 +82,9 @@ that is already enrolled.
 
 `--project` writes `.claude/settings.local.json` in the checkout (git is told to ignore it: it
 holds the binary's absolute path), so Claude Code refuses a tool call there whenever the hook
-cannot run. `uninstall` restores the hook files byte for byte, removes the slots, the state, the
-project wiring and the registry entry, and takes the agents' wiring out with the last checkout.
+cannot run. `uninstall` restores the hook files byte for byte (a `pre-commit` it created is
+deleted), removes the slots, the state, the project wiring and the registry entry, and takes the
+agents' wiring out with the last checkout.
 
 Then tell your agents to commit with `git mux commit -m MSG -- PATH...` and push with
 `git mux push`, for example in the repository's `AGENTS.md`.
@@ -96,16 +97,21 @@ Two layers, independent of each other, so that a gap in one does not open the ot
 
 - A `reference-transaction` hook refuses every move of the shared branch except `git mux` and a
   fast-forward to commits a remote already has (a plain `git pull --ff-only` still works), and a
-  new `refs/stash`. That is what stops a plain `git commit`, `git reset --soft` or
-  `git branch -f`, from any worktree. `GIT_MUX=1` lets one deliberate ref move through.
-- A guard line in front of the repository's `pre-commit`, `commit-msg` and `pre-push` hooks
-  refuses a plain `git commit` or `git push` before those hooks run, so no hook ever runs in the
-  live tree. It exists only where such an executable hook file does; a hook that is not a shell
-  script or a symlink is chained behind a small wrapper, and a hook manager that regenerates its
-  directory (husky) gets the line again on the next `git mux` run. `GIT_MUX` never opens this
-  guard. `GIT_MUX=1 git commit --no-verify` is the deliberate bypass; `prepare-commit-msg` is not
-  guarded and still runs.
-- A person's `git push --no-verify` is not stopped: git skips the hook that would refuse it.
+  new `refs/stash`. Deleting the branch (`git update-ref -d`) is refused like moving it. That is
+  what stops a plain `git commit`, `git reset --soft` or `git branch -f`, from any worktree.
+  `GIT_MUX=1` lets one deliberate ref move through.
+- A guard line in front of the repository's `pre-commit`, `prepare-commit-msg`, `commit-msg` and
+  `pre-push` hook files refuses a plain `git commit` or `git push` before any of them does its
+  work, so no hook file runs in the live tree. A missing `pre-commit` is created for the guard
+  (`uninstall` removes it again); the other three are guarded where they exist. A hook that is
+  not a shell script or a symlink is chained behind a small wrapper, and a hook manager that
+  regenerates its directory (husky) gets the line again on the next `git mux` run. `GIT_MUX`
+  never opens the guards of `pre-commit`, `commit-msg` and `pre-push`, so `GIT_MUX=1 git commit`
+  is refused. `GIT_MUX=1 git commit --no-verify` is the one deliberate bypass: only
+  `prepare-commit-msg`'s line lets `GIT_MUX` through, so that this command runs it, and a plain
+  `git commit --no-verify` is refused there.
+- A person's `git push --no-verify` is not stopped: git skips the hook that would refuse it. The
+  agent hook refuses it.
 - A hooks directory that git tracks is never edited. `git mux install` prints the lines to add
   instead, and the `reference-transaction` guard is not installed there.
 
@@ -130,9 +136,10 @@ Two layers, independent of each other, so that a gap in one does not open the ot
   checkout when the hook cannot run. Codex's handling of a hook that cannot run is undocumented:
   treat Codex as fail-open.
 
-**Known limits**: a *configured* hook (`hook.<name>.event`, git 2.54 and newer) runs before the
-hook file and cannot be stopped by it, so a person's plain `git commit` still runs it in the live
-tree (install prints a note naming such hooks; agents are covered by the agent hook); inline
+**Known limits**: a *configured* hook (`hook.<name>.event`, git 2.54 and newer) is the one hook
+that can run in the live tree: it runs before any hook file and cannot be stopped by a guard, so a
+person's plain `git commit` still runs it (`git mux status` and `install` name such hooks; agents
+are refused before git runs); inline
 interpreter code (`python -c`, `node -e`) and script files are not parsed; and a shell command's
 writes are attributed to its session only when no other session was active meanwhile.
 
@@ -153,8 +160,8 @@ file (same syntax):
 `slotSetup` is where a slot gets what its hooks need (built dependencies, a cloned
 `node_modules`); git-mux names no framework. A committed `.gitmux` runs its `slotSetup` for
 everyone who commits in the checkout, which is the same trust as the repository's own hooks.
-`selfInstall` replaces the binary, so only the repository's own config can set it, never a
-committed file.
+`selfInstall` replaces the binary, so only the repository's local git config can set it, never a
+committed file, the global config or the system config.
 
 A hooks directory that git ignores and the slot therefore lacks (husky's) is copied into the
 slot when `core.hooksPath` is a relative path inside the repository; a hook the checkout has and

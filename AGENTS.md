@@ -19,11 +19,15 @@ each other's work.
   manager. git-mux never names a linter or a framework.
 - Slots are persistent and `git worktree lock`ed: they hold built dependencies, and cleanup must
   not delete them.
-- No hook ever runs in the live tree of the shared checkout, and there is no exception: a guard
-  line in front of the pre-commit, commit-msg and pre-push files refuses a plain commit or push
-  before they run, and `GIT_MUX=1` skips only the reference-transaction guard (a deliberate ref
-  move). The one deliberate bypass is `GIT_MUX=1 git commit --no-verify`. post-commit is not run
-  at all, and prepare-commit-msg stays unguarded because that bypass runs it.
+- No hook file runs in the live tree of the shared checkout: a guard line in front of the
+  pre-commit, prepare-commit-msg, commit-msg and pre-push files refuses a plain commit or push
+  before they run (a missing pre-commit is created for it, and uninstall deletes it again).
+  `GIT_MUX=1` skips the reference-transaction guard (a deliberate ref move) and
+  prepare-commit-msg's line, and nothing else: the one deliberate bypass is `GIT_MUX=1 git commit
+  --no-verify`, which runs prepare-commit-msg, while a plain `--no-verify` is refused there and
+  `GIT_MUX=1 git commit` by pre-commit. post-commit is not run at all. The one exception is a
+  configured hook (see Traps). The shared branch is protected against deletion like against a
+  move.
 - The agent hook parses every payload and fails closed: a crash, a git error or an unreadable
   payload that names an enrolled checkout exits 2, which both Claude Code and Codex honour as a
   refusal. A call that concerns no enrolled checkout exits 0, and lifecycle events never refuse
@@ -44,7 +48,8 @@ each other's work.
   "unowned" until the session's next `Stop`, never to a wrong owner. A shell command's writes
   become its session's only when no other session was active in the same window.
 - Only `git mux install` enrolls a checkout; every other command repairs the guards of one that
-  is enrolled and touches nothing else. `uninstall` gives every hook file back byte for byte.
+  is enrolled and touches nothing else. `uninstall` gives every hook file back byte for byte (a
+  pre-commit it created is deleted).
 - Publishing writes a journal first; every run heals an interrupted one before doing anything.
 
 ## Traps
@@ -59,11 +64,12 @@ each other's work.
   and generated one (husky) is rewritten on every run, so git-mux adds its line again on each
   `git mux` call; the slot copies it from the checkout, and a hook the checkout has but the slot
   lacks refuses.
-- A configured hook (`hook.<name>.event`, git 2.54+) runs before the hook file and cannot be
-  stopped by it; only the agent hook covers agents there. The shell parser is hand-written
-  (`serde_json` is the only dependency): any word `git` or `…/git` starts a git invocation
-  wherever it stands, and inline interpreter code and script files are not parsed — the git layer
-  still refuses branch moves, stash and live-tree hooks.
+- A configured hook (`hook.<name>.event`, git 2.54+) runs before any hook file and cannot be
+  stopped by a guard: it is the one hook that runs in the live tree on a person's plain commit,
+  `git mux status` names it, and only the agent hook covers agents there. The shell parser is
+  hand-written (`serde_json` is the only dependency): any word `git` or `…/git` starts a git
+  invocation wherever it stands, and inline interpreter code and script files are not parsed — the
+  git layer still refuses branch moves, stash and live-tree hook files.
 - Every git call runs with `GIT_LITERAL_PATHSPECS=1` so `[id]` paths stay literal; what runs user
   code (hooks, `slotSetup`) or needs a glob has it removed. `slotSetup` is shell run for anyone
   who commits in the checkout, the same trust as its hooks; `selfInstall` replaces the binary, so
