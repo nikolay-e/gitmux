@@ -31,9 +31,10 @@ const USAGE: &str = "usage: git mux commit -m MSG [--take] [--] PATH...
        git mux install   guard this checkout and wire the Claude Code / Codex hooks
        git mux hook      (called by the agents around every tool call)";
 
-fn message_and_paths(args: &[String]) -> Result<(String, Vec<String>)> {
+fn message_and_paths(args: &[String]) -> Result<(String, Vec<String>, bool)> {
     let mut messages = Vec::new();
     let mut paths = Vec::new();
+    let mut take = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -43,7 +44,7 @@ fn message_and_paths(args: &[String]) -> Result<(String, Vec<String>)> {
                     .ok_or_else(|| Refused(format!("{a} needs a message")))?
                     .clone(),
             ),
-            "--take" => {}
+            "--take" => take = true,
             m if m.starts_with("--message=") => messages.push(m["--message=".len()..].to_string()),
             m if m.starts_with("-m") => messages.push(m[2..].to_string()),
             m if m.starts_with('-') => return Err(Refused(format!("unknown option {m}\n{USAGE}"))),
@@ -61,6 +62,7 @@ fn message_and_paths(args: &[String]) -> Result<(String, Vec<String>)> {
             message + "\n"
         },
         paths,
+        take,
     ))
 }
 
@@ -74,11 +76,11 @@ fn run(args: &[String]) -> Result<()> {
     journal::heal(&repo)?;
     match cmd {
         "commit" => {
-            let (message, paths) = message_and_paths(&args[1..])?;
-            commit::commit(&repo, &message, &paths)
+            let (message, paths, take) = message_and_paths(&args[1..])?;
+            commit::commit(&repo, &message, &paths, take)
         }
         "sync" => sync::sync(&repo),
-        "push" => sync::push(&repo),
+        "push" => sync::push(&repo, &args[1..]),
         "status" => sync::status(&repo),
         _ => install::install(&repo),
     }

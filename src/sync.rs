@@ -161,7 +161,10 @@ pub fn bring_tree(repo: &Repo, tip: &str, paths: &[String]) -> Result<()> {
 
 /// git's own pre-push hook would run in the live tree, where pre-commit stashes every other
 /// session's unsaved files while it runs; the same hooks run in a slot on the exact sha.
-pub fn push(repo: &Repo) -> Result<()> {
+pub fn push(repo: &Repo, refs: &[String]) -> Result<()> {
+    if !refs.is_empty() {
+        refuse!("pushing named refs is not supported yet");
+    }
     let remote = repo.upstream_remote();
     for _attempt in 0..3 {
         sync(repo)?;

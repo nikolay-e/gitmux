@@ -3,6 +3,35 @@ use crate::run::{Cmd, Result};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap};
 
+/// Who is acting: the agent session and, for a subagent, its id.
+pub struct Owner {
+    session: Option<String>,
+    #[allow(dead_code)]
+    agent: Option<String>,
+}
+
+impl Owner {
+    pub fn from_payload(p: &Value) -> Owner {
+        let text = |k: &str| p[k].as_str().map(String::from);
+        Owner {
+            session: text("session_id"),
+            agent: text("agent_id"),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn of_process() -> Owner {
+        Owner {
+            session: std::env::var("CLAUDE_CODE_SESSION_ID").ok(),
+            agent: None,
+        }
+    }
+
+    fn session(&self) -> &str {
+        self.session.as_deref().unwrap_or("unknown")
+    }
+}
+
 impl Repo {
     pub fn leases(&self) -> Result<Map<String, Value>> {
         let held = read_json(&self.state.join("leases.json"))
@@ -22,7 +51,8 @@ impl Repo {
 
     /// Claims every unowned or orphaned path for the session, marks when it last touched each, and
     /// returns those a live session holds.
-    pub fn claim(&self, session: &str, paths: &[String]) -> Result<BTreeMap<String, String>> {
+    pub fn claim(&self, owner: &Owner, paths: &[String]) -> Result<BTreeMap<String, String>> {
+        let session = owner.session();
         let _lock = self.lock("leases")?;
         let mut held = self.leases()?;
         let mut foreign = BTreeMap::new();
@@ -57,7 +87,8 @@ impl Repo {
         Ok(foreign)
     }
 
-    pub fn foreign_leases(&self, session: &str, paths: &[String]) -> Result<String> {
+    pub fn foreign_leases(&self, owner: &Owner, paths: &[String]) -> Result<String> {
+        let session = owner.session();
         let held = self.leases()?;
         let foreign: Vec<String> = paths
             .iter()
@@ -136,4 +167,19 @@ pub fn alive(lease: &Value) -> bool {
     };
     let start = lease.get("start").and_then(Value::as_str).unwrap_or("");
     ps_start(pid).is_none_or(|s| s == start)
+}
+
+#[allow(dead_code, unused_variables)]
+pub fn refuse_foreign(repo: &Repo, paths: &[String], owner: &Owner, take: bool) -> Result<()> {
+    Ok(())
+}
+
+#[allow(dead_code, unused_variables)]
+pub fn release_session(repo: &Repo, session: &str) -> Result<()> {
+    Ok(())
+}
+
+#[allow(dead_code, unused_variables)]
+pub fn adopt_subagent(repo: &Repo, session: &str, agent: &str) -> Result<()> {
+    Ok(())
 }

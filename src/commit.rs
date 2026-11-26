@@ -203,7 +203,8 @@ fn needs_reverify(repo: &Repo, base: &str, head: &str, paths: &[String]) -> Resu
         .any(|p| starts(p, &inputs) || !starts(p, &covered)))
 }
 
-pub fn commit(repo: &Repo, message: &str, args: &[String]) -> Result<()> {
+#[allow(unused_variables)]
+pub fn commit(repo: &Repo, message: &str, args: &[String], take: bool) -> Result<()> {
     let paths = expand(repo, args, None)?;
     let base = repo.head()?;
     let mut candidate = None;

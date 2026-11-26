@@ -96,7 +96,10 @@ fn provision_node_modules(repo: &Repo, slot: &Path) -> Result<()> {
 }
 
 pub fn run_hook(dir: &Path, name: &str, args: &[&str], stdin: Option<&Path>) -> Result<bool> {
-    let mut c = Cmd::git(dir).args(["hook", "run", "--ignore-missing"]);
+    let mut c =
+        Cmd::git(dir)
+            .env_remove("GIT_LITERAL_PATHSPECS")
+            .args(["hook", "run", "--ignore-missing"]);
     if let Some(s) = stdin {
         c = c.arg(format!("--to-stdin={}", s.display()));
     }

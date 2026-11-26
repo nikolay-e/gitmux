@@ -2,10 +2,10 @@
 //! blocking signal both honour, so a refusal and a crash both end that way.
 use crate::commit::expand;
 use crate::install::registered_roots;
-use crate::lease::{agent_process, alive, holder, short};
+use crate::lease::{Owner, agent_process, alive, holder, short};
 use crate::repo::{Repo, inside, now, read_json};
 use crate::run::{Result, zsplit};
-use crate::shell::{Kind, commit_paths, guard_git, invocations, patch_paths};
+use crate::shell::{Kind, argv_invocations, commit_paths, guard_git, invocations, patch_paths};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 use std::fs;
@@ -82,15 +82,18 @@ fn decide(p: &Value, roots: &[PathBuf]) -> Result<Decision> {
         .unwrap_or_default();
     let post = p["hook_event_name"].as_str() == Some("PostToolUse");
     let session = p["session_id"].as_str().unwrap_or("unknown");
+    let owner = Owner::from_payload(p);
 
     if tool == "Bash" {
-        let command = match &data["command"] {
-            Value::Array(a) => a
-                .iter()
+        let argv: Option<Vec<String>> = data["command"].as_array().map(|a| {
+            a.iter()
                 .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(" "),
-            v => v.as_str().unwrap_or("").to_string(),
+                .map(String::from)
+                .collect()
+        });
+        let command = match &argv {
+            Some(a) => a.join(" "),
+            None => data["command"].as_str().unwrap_or("").to_string(),
         };
         let mut touched: BTreeSet<&PathBuf> = roots
             .iter()
@@ -108,8 +111,13 @@ fn decide(p: &Value, roots: &[PathBuf]) -> Result<Decision> {
             });
         }
         let mut claims = Vec::new();
-        for inv in invocations(&command, &cwd) {
-            let Some(root) = root_of(&inv.dir, roots) else {
+        let parsed = match &argv {
+            Some(a) => argv_invocations(a, &cwd),
+            None => invocations(&command, &cwd),
+        };
+        for inv in parsed.unwrap_or_default() {
+            let Some(dir) = inv.dir else { continue };
+            let Some(root) = root_of(&dir, roots) else {
                 continue;
             };
             touched.insert(root);
@@ -124,7 +132,7 @@ fn decide(p: &Value, roots: &[PathBuf]) -> Result<Decision> {
             } else if inv.args.first().map(String::as_str) == Some("commit")
                 && !inv.args.iter().any(|a| a == "--take")
             {
-                claims.push((root, inv.dir, commit_paths(&inv.args[1..])));
+                claims.push((root, dir, commit_paths(&inv.args[1..])));
             }
         }
         for (root, dir, paths) in claims {
@@ -132,7 +140,7 @@ fn decide(p: &Value, roots: &[PathBuf]) -> Result<Decision> {
             let Ok(paths) = expand(&repo, &paths, Some(&dir)) else {
                 continue;
             };
-            let held = repo.foreign_leases(session, &paths)?;
+            let held = repo.foreign_leases(&owner, &paths)?;
             if !held.is_empty() {
                 return Ok(Decision::Deny(format!(
                     "{held} has uncommitted edits by another live agent; commit only your own paths, or pass --take when that session handed them over."
@@ -176,7 +184,7 @@ fn decide(p: &Value, roots: &[PathBuf]) -> Result<Decision> {
             .iter()
             .filter_map(|f| repo.rel(&f.to_string_lossy(), Some(&cwd)))
             .collect();
-        let foreign = repo.claim(session, &paths)?;
+        let foreign = repo.claim(&owner, &paths)?;
         if !foreign.is_empty() {
             let owners: Vec<String> = foreign
                 .iter()
@@ -325,7 +333,7 @@ fn shell_snapshot(repo: &Repo, p: &Value, session: &str) -> Result<Option<String
         .cloned()
         .collect();
     if !loose.is_empty() && busy.is_empty() {
-        repo.claim(session, &loose)?;
+        repo.claim(&Owner::from_payload(p), &loose)?;
     }
     let noted: Vec<String> = noted
         .into_iter()

@@ -108,7 +108,7 @@ pub enum Kind {
 #[derive(Debug)]
 pub struct Invocation {
     pub kind: Kind,
-    pub dir: PathBuf,
+    pub dir: Option<PathBuf>,
     pub args: Vec<String>,
 }
 
@@ -123,11 +123,10 @@ fn is_assignment(w: &str) -> bool {
 }
 
 /// Every git and git-mux invocation in the command, with the directory it runs in (following
-/// `cd` and `git -C`). `git mux …` counts as git-mux. An unparsable command yields nothing.
-pub fn invocations(command: &str, cwd: &Path) -> Vec<Invocation> {
-    let Some(toks) = lex(&strip_heredocs(command)) else {
-        return Vec::new();
-    };
+/// `cd` and `git -C`; None when it is not known). `git mux …` counts as git-mux. None when the
+/// command cannot be parsed.
+pub fn invocations(command: &str, cwd: &Path) -> Option<Vec<Invocation>> {
+    let toks = lex(&strip_heredocs(command))?;
     let mut out = Vec::new();
     let mut here = cwd.to_path_buf();
     let mut seg: Vec<String> = Vec::new();
@@ -150,26 +149,30 @@ pub fn invocations(command: &str, cwd: &Path) -> Vec<Invocation> {
                     match subcommand(&args) {
                         Some((i, "mux")) => out.push(Invocation {
                             kind: Kind::Mux,
-                            dir,
+                            dir: Some(dir),
                             args: args[i + 1..].to_vec(),
                         }),
                         _ => out.push(Invocation {
                             kind: Kind::Git,
-                            dir,
+                            dir: Some(dir),
                             args,
                         }),
                     }
                 } else if first.ends_with("git-mux") {
                     out.push(Invocation {
                         kind: Kind::Mux,
-                        dir: here.clone(),
+                        dir: Some(here.clone()),
                         args: words[1..].to_vec(),
                     });
                 }
             }
         }
     }
-    out
+    Some(out)
+}
+
+pub fn argv_invocations(argv: &[String], cwd: &Path) -> Option<Vec<Invocation>> {
+    invocations(&argv.join(" "), cwd)
 }
 
 fn subcommand(args: &[String]) -> Option<(usize, &str)> {

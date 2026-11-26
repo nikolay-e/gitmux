@@ -91,6 +91,11 @@ impl Cmd {
         self
     }
 
+    pub fn env_remove(mut self, key: &str) -> Self {
+        self.cmd.env_remove(key);
+        self
+    }
+
     pub fn input(mut self, data: impl Into<Vec<u8>>) -> Self {
         self.input = Some(data.into());
         self
