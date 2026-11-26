@@ -75,8 +75,10 @@ git mux --version
 ```
 
 `git mux install` enrolls the repository, installs the git guards, and wires the user-level hooks
-of every agent whose config directory exists (`~/.claude/settings.json`, `~/.codex/hooks.json`),
-keeping your other hooks. Codex runs a changed hook only after you trust it once with `/hooks`.
+of every agent whose config directory exists, keeping your other hooks. Claude Code's file is
+`$CLAUDE_CONFIG_DIR/settings.json` when that variable is set, else `~/.claude/settings.json`;
+Codex's is `$CODEX_HOME/hooks.json` when set, else `~/.codex/hooks.json`. Run `uninstall` with
+the same environment. Codex runs a changed hook only after you trust it once with `/hooks`.
 Only `install` enrolls a checkout; any other `git mux` command merely repairs the guards of one
 that is already enrolled.
 
@@ -97,12 +99,18 @@ Two layers, independent of each other, so that a gap in one does not open the ot
 
 - A `reference-transaction` hook refuses every move of the shared branch except `git mux` and a
   fast-forward to commits a remote already has (a plain `git pull --ff-only` still works), and a
-  new `refs/stash`. Deleting the branch (`git update-ref -d`) is refused like moving it. That is
-  what stops a plain `git commit`, `git reset --soft` or `git branch -f`, from any worktree.
+  new `refs/stash`. Deleting the branch (`git update-ref -d`) is refused like moving it, unless
+  the old id equals both a loose and a packed copy of the branch, which is how git reports
+  `pack-refs` pruning: `git pack-refs --all --no-prune` followed by `git update-ref -d` with that
+  id passes. That is what stops a plain `git commit`, `git reset --soft` or `git branch -f`, from
+  any worktree.
   `GIT_MUX=1` lets one deliberate ref move through.
 - A guard line in front of the repository's `pre-commit`, `prepare-commit-msg`, `commit-msg` and
   `pre-push` hook files refuses a plain `git commit` or `git push` before any of them does its
-  work, so no hook file runs in the live tree. A missing `pre-commit` is created for the guard
+  work, so none of those hook files runs in the live tree. Hooks of other commands
+  (`pre-merge-commit`, `pre-rebase`, `post-checkout`, …) still run there when a person runs those
+  commands; agents are refused such commands before git runs, and the `reference-transaction` guard
+  refuses any move of the shared branch. A missing `pre-commit` is created for the guard
   (`uninstall` removes it again); the other three are guarded where they exist. A hook that is
   not a shell script or a symlink is chained behind a small wrapper, and a hook manager that
   regenerates its directory (husky) gets the line again on the next `git mux` run. `GIT_MUX`
@@ -124,6 +132,11 @@ Two layers, independent of each other, so that a gap in one does not open the ot
   wrapper, with `-c alias.*` or `-c core.hooksPath`. The price is that an unquoted
   `echo git push` is refused too. In an enrolled checkout, a command that names git and cannot
   be parsed is refused.
+- Where git runs is read from `git -C DIR` and from `cd`. `cd DIR && git …` and `git -C DIR …`
+  are understood (unless a `||` before the `cd` made it conditional). A `cd DIR` on its own line
+  or before `;` counts when DIR is an existing literal path and no `if`, loop, `case`, function or
+  `||` makes it conditional. Otherwise the directory is unknown, the command counts as the
+  checkout the shell is in, and the refusal says so.
 - A *lease* belongs to a session, a subagent of it and the agent process hosting both. Another
   session's edit or `git mux commit` of a leased file is refused; two subagents of one session
   hold leases against each other. A lease ends when its file equals `HEAD` again, when its agent
@@ -134,14 +147,16 @@ Two layers, independent of each other, so that a gap in one does not open the ot
   0 when the binary is missing, so other projects are never blocked; the project hook of
   `--project` (`onFailure: "block"`, Claude Code 2.1.295 or newer) blocks the call in that
   checkout when the hook cannot run. Codex's handling of a hook that cannot run is undocumented:
-  treat Codex as fail-open.
+  treat Codex as fail-open. Input sent to a running command with Codex's `write_stdin`, for example
+  into an interactive shell it started, does not pass `PreToolUse`, so only the git-level guards
+  apply to it.
 
-**Known limits**: a *configured* hook (`hook.<name>.event`, git 2.54 and newer) is the one hook
-that can run in the live tree: it runs before any hook file and cannot be stopped by a guard, so a
-person's plain `git commit` still runs it (`git mux status` and `install` name such hooks; agents
-are refused before git runs); inline
-interpreter code (`python -c`, `node -e`) and script files are not parsed; and a shell command's
-writes are attributed to its session only when no other session was active meanwhile.
+**Known limits**: a *configured* hook (`hook.<name>.event`, git 2.54 and newer) is the one commit
+or push hook that can run in the live tree: it runs before any hook file and cannot be stopped by
+a guard, so a person's plain `git commit` still runs it (`git mux status` and `install` name such
+hooks; agents are refused before git runs); inline interpreter code (`python -c`, `node -e`) and
+script files are not parsed; and a shell command's writes are attributed to its session only when
+no other session was active meanwhile.
 
 ## Configuration
 

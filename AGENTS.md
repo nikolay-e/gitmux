@@ -19,15 +19,24 @@ each other's work.
   manager. git-mux never names a linter or a framework.
 - Slots are persistent and `git worktree lock`ed: they hold built dependencies, and cleanup must
   not delete them.
-- No hook file runs in the live tree of the shared checkout: a guard line in front of the
-  pre-commit, prepare-commit-msg, commit-msg and pre-push files refuses a plain commit or push
-  before they run (a missing pre-commit is created for it, and uninstall deletes it again).
+- No commit or push hook file runs in the live tree of the shared checkout: a guard line in front
+  of the pre-commit, prepare-commit-msg, commit-msg and pre-push files refuses a plain commit or
+  push before they run (a missing pre-commit is created for it, and uninstall deletes it again).
+  Hooks of other commands (pre-merge-commit, pre-rebase, applypatch-msg, post-checkout,
+  post-merge, post-rewrite, …) still run there when a person runs those commands; agents are
+  refused such commands before git runs, and the ref guard refuses any move of the shared branch.
   `GIT_MUX=1` skips the reference-transaction guard (a deliberate ref move) and
   prepare-commit-msg's line, and nothing else: the one deliberate bypass is `GIT_MUX=1 git commit
   --no-verify`, which runs prepare-commit-msg, while a plain `--no-verify` is refused there and
   `GIT_MUX=1 git commit` by pre-commit. post-commit is not run at all. The one exception is a
   configured hook (see Traps). The shared branch is protected against deletion like against a
-  move.
+  move (see Traps for the one form let through).
+- The agent hook names a directory for an invocation only when the shell is surely there when git
+  runs: `git -C DIR …` and `cd DIR && git …` (unless a `||` before the `cd` made it
+  conditional); `cd DIR` on its own line or before `;` when DIR is an existing literal path and no
+  `if`, loop, `case`, function or `||` makes it conditional. Every doubt makes the directory
+  unknown, never wrong: the command then counts as the checkout the shell is in, else as every
+  checkout the text names, and the refusal says so.
 - The agent hook parses every payload and fails closed: a crash, a git error or an unreadable
   payload that names an enrolled checkout exits 2, which both Claude Code and Codex honour as a
   refusal. A call that concerns no enrolled checkout exits 0, and lifecycle events never refuse
@@ -64,12 +73,17 @@ each other's work.
   and generated one (husky) is rewritten on every run, so git-mux adds its line again on each
   `git mux` call; the slot copies it from the checkout, and a hook the checkout has but the slot
   lacks refuses.
+- The ref guard lets through a deletion of the shared branch whose old id equals both a loose and
+  a packed copy of it, because that is how git reports `pack-refs` pruning. So `git pack-refs
+  --all --no-prune` followed by `git update-ref -d <branch> <its id>` passes; it takes two
+  deliberate commands, and the accidental forms (`update-ref -d` without an old id, `branch -D`)
+  are refused.
 - A configured hook (`hook.<name>.event`, git 2.54+) runs before any hook file and cannot be
-  stopped by a guard: it is the one hook that runs in the live tree on a person's plain commit,
-  `git mux status` names it, and only the agent hook covers agents there. The shell parser is
-  hand-written (`serde_json` is the only dependency): any word `git` or `…/git` starts a git
-  invocation wherever it stands, and inline interpreter code and script files are not parsed — the
-  git layer still refuses branch moves, stash and live-tree hook files.
+  stopped by a guard: it is the one commit or push hook that runs in the live tree on a person's
+  plain commit, `git mux status` names it, and only the agent hook covers agents there. The shell
+  parser is hand-written (`serde_json` is the only dependency): any word `git` or `…/git` starts a
+  git invocation wherever it stands, and inline interpreter code and script files are not parsed —
+  the git layer still refuses branch moves, stash and live-tree commit and push hook files.
 - Every git call runs with `GIT_LITERAL_PATHSPECS=1` so `[id]` paths stay literal; what runs user
   code (hooks, `slotSetup`) or needs a glob has it removed. `slotSetup` is shell run for anyone
   who commits in the checkout, the same trust as its hooks; `selfInstall` replaces the binary, so
